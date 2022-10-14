@@ -134,10 +134,12 @@ int main(int argc, char *argv[])
     {
         return 1;
     }
+    requestProcess::m_threadpool = pool;
 
     //预先为每个可能的客户连接分配一个requestProcess对象
     requestProcess *users = new requestProcess[MAX_FD];
     assert(users);
+    requestProcess::m_users = users;
 
     //初始化数据库读取表
     users->initmysql_result(connPool);
@@ -279,10 +281,13 @@ int main(int argc, char *argv[])
                 {
                     LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
                     Log::get_instance()->flush();
-                    pool->append(users + sockfd);
+                    pool->append(users + sockfd, 0);
                 }
-                else
+                else //关闭连接
                 {
+                    users[sockfd].close_conn();
+                    LOG_INFO("close fd %d", sockfd);
+                    Log::get_instance()->flush();
                 }
             }
             else if (events[i].events & EPOLLOUT)
@@ -295,8 +300,11 @@ int main(int argc, char *argv[])
                 if (users[sockfd].write())
                 {
                 }
-                else
+                else //关闭连接
                 {
+                    users[sockfd].close_conn();
+                    LOG_INFO("close fd %d", sockfd);
+                    Log::get_instance()->flush();
                 }
             }
         }

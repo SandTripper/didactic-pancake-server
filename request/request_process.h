@@ -2,6 +2,7 @@
 #define REQUEST_PROCESS_H
 
 #include <unistd.h>
+#include <list>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/epoll.h>
@@ -18,9 +19,13 @@
 #include <sys/mman.h>
 #include <stdarg.h>
 #include <errno.h>
+
 #include "../locker/locker.h"
 #include "../sqlconnpool/sql_connection_pool.h"
+#include "../threadpool/threadpool.h"
 #include "../log/log.h"
+
+class DataPacket;
 
 class requestProcess
 {
@@ -35,13 +40,19 @@ public:
     LGN表示登录请求；
     RGT表示注册请求；
     LGT表示登出请求；
+    SCU表示查找用户请求；
+    ADF表示添加好友请求；
+    RFR表示回复好友请求；
     */
     enum REQUEST
     {
         HBT = 0,
         LGN,
         RGT,
-        LGT
+        LGT,
+        SCU,
+        ADF,
+        RFR,
     };
 
     //主状态机的两种可能状态，分别表示：当前正在分析请求行，当前正在分析内容
@@ -88,7 +99,7 @@ public:
     void close_conn(bool real_close = true);
 
     //处理客户端请求
-    void process();
+    void process(int mode);
 
     //非阻塞读操作
     bool read();
@@ -102,15 +113,24 @@ public:
     //初始化数据库，读出到map
     void initmysql_result(connectionPool *connPool);
 
+    //往待发送数组里添加数据包
+    void append_data(const DataPacket &data);
+
 private:
     //初始化连接
     void init();
+
+    //初始化读
+    void init_read();
+
+    //初始化写
+    void init_write();
 
     //解析请求
     RESULT_CODE process_read();
 
     //填充应答
-    bool process_write(RESULT_CODE ret);
+    bool process_write();
 
     //下面这一组函数被process_read调用以分析请求
     RESULT_CODE parse_request_line(char *text);
@@ -130,12 +150,23 @@ private:
     bool add_blank_line();
 
     //下面这一组为客户请求逻辑处理函数
+    //处理心跳包逻辑
+    void heartbeat();
     //处理登录逻辑
     void login();
     //处理注册逻辑
     void regis();
     //处理登出逻辑
     void logout();
+    //处理搜索用户逻辑
+    void search_user();
+    //处理添加好友逻辑
+    void add_friend();
+    //处理回复好友申请逻辑
+    void reply_friend_request();
+
+    // REQUEST转const char*
+    const char *ReqToString(REQUEST r);
 
 public:
     /*所有socket上的事件都被注册到同一个epoll内核事件表中,
@@ -147,6 +178,12 @@ public:
 
     //指向全局唯一连接池实例的指针
     connectionPool *m_connPool;
+
+    //线程池对象
+    static threadpool *m_threadpool;
+
+    //所有requestProcess对象
+    static requestProcess *m_users;
 
 private:
     //该连接的socket和对方的socket地址
@@ -197,14 +234,53 @@ private:
     // connfd是否开启ET模式，ET模式为1，LT模式为0
     int m_connfd_Trig_mode;
 
-    //返回的状态
-    char m_response_status[16];
+    //当前是否有线程在处理写请求,配一把互斥锁
+    mutexLocker m_lock_isProcessWrite;
+    int isProcessWrite;
 
-    //返回的正文长度
-    int m_response_content_len;
+    //待发送的数据包,配一把互斥锁
+    mutexLocker m_lock_datas;
+    list<DataPacket> m_datas;
+};
 
-    //返回的正文
-    char m_response_content[1024];
+//数据包类
+class DataPacket
+{
+public:
+    DataPacket()
+    {
+        category = requestProcess::HBT;
+        content = NULL;
+        content_len = 0;
+    }
+    DataPacket(requestProcess::REQUEST cat, const char *con)
+    {
+        category = cat;
+        content_len = strlen(con);
+        content = new char[content_len];
+        strncpy(content, con, content_len);
+    }
+    DataPacket(requestProcess::REQUEST cat, int conlen, const char *con)
+    {
+        category = cat;
+        content_len = conlen;
+        content = new char[conlen];
+        strncpy(content, con, conlen);
+    }
+    DataPacket(const DataPacket &other)
+    {
+        category = other.category;
+        content_len = other.content_len;
+        content = new char[content_len];
+        strncpy(content, other.content, content_len);
+    }
+    ~DataPacket()
+    {
+        delete[] content;
+    }
+    requestProcess::REQUEST category;
+    int content_len;
+    char *content;
 };
 
 #endif // REQUEST_PROCESS_H

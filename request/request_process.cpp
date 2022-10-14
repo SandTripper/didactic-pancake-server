@@ -1,23 +1,31 @@
 #include "request_process.h"
 
 #include <map>
+#include <set>
 
 using namespace std;
 
 int requestProcess::m_user_count = 0;
 int requestProcess::m_epollfd = -1;
 
+threadpool *requestProcess::m_threadpool = NULL;
+requestProcess *requestProcess::m_users = NULL;
+
 //将表中的用户名和密码放入map
 map<string, string> user_mp;
 
+//为了运行调试方便，以下表均未同步至数据库
 // sessionID的map
 map<long long, string> sessionID_mp;
-
 // 储存用户名对应的描述符
-map<string, string> userfd_mp;
+map<string, int> userfd_mp;
+// 储存好友申请
+map<string, set<string>> frireq_mp;
+// 储存好友关系
+map<string, set<string>> friend_mp;
 
-mutexLocker m_lock;       //互斥锁
-readWriteLocker m_rwlock; //读写锁
+mutexLocker lock;       //互斥锁
+readWriteLocker rwlock; //读写锁
 
 //将文件描述符设置为非阻塞
 int setnonblocking(int fd)
@@ -94,23 +102,34 @@ void requestProcess::init(int sockfd, const sockaddr_in &addr, connectionPool *c
     addfd(m_epollfd, sockfd, true, m_connfd_Trig_mode);
     m_user_count++;
 
+    m_sessionID = 0;
     init();
 }
 
 void requestProcess::init()
 {
-    m_bytes_have_send = 0;
-    m_bytes_to_send = 0;
-    m_check_state = CHECK_STATE_REQUESTLINE;
+    init_read();
+    init_write();
+}
 
+//初始化读
+void requestProcess::init_read()
+{
+    m_check_state = CHECK_STATE_REQUESTLINE;
     m_method = HBT;
     m_start_line = 0;
     m_checked_idx = 0;
-    m_read_idx = 0;
-    m_write_idx = 0;
     m_content_length = 0;
-    m_sessionID = 0;
+    m_read_idx = 0;
     memset(m_read_buf, '\0', READ_BUFFER_SIZE);
+}
+
+//初始化写
+void requestProcess::init_write()
+{
+    m_bytes_have_send = 0;
+    m_bytes_to_send = 0;
+    m_write_idx = 0;
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
 }
 
@@ -121,24 +140,41 @@ void requestProcess::close_conn(bool real_close)
         removefd(m_epollfd, m_sockfd);
         m_sockfd = -1;
         m_user_count--; //关闭一个连接时，将客户总量减1
+
+        lock.lock();
+        auto it = sessionID_mp.find(m_sessionID);
+        if (it != sessionID_mp.end())
+        {
+            LOG_INFO("user %s logout", sessionID_mp[m_sessionID].c_str());
+            Log::get_instance()->flush();
+
+            userfd_mp.erase(sessionID_mp[m_sessionID]);
+            sessionID_mp.erase(it);
+        }
+        lock.unlock();
     }
 }
 
-void requestProcess::process()
+void requestProcess::process(int mode)
 {
-    RESULT_CODE read_ret = process_read();
-    if (read_ret == NO_REQUEST)
+    if (mode == 0)
     {
+        RESULT_CODE read_ret = process_read();
+        if (read_ret != NO_REQUEST)
+        {
+            init_read();
+        }
         modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-        return;
     }
-
-    bool write_ret = process_write(read_ret);
-    if (!write_ret)
+    else
     {
-        close_conn();
+        bool write_ret = process_write();
+        if (!write_ret)
+        {
+            close_conn();
+        }
+        modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
     }
-    modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
 }
 
 bool requestProcess::read()
@@ -199,7 +235,7 @@ bool requestProcess::write()
     if (m_bytes_to_send == 0)
     {
         modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-        init();
+        init_write();
         return true;
     }
 
@@ -231,7 +267,7 @@ bool requestProcess::write()
             //发送响应成功
             modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
             //长连接
-            init();
+            init_write();
             return true;
         }
     }
@@ -272,6 +308,13 @@ void requestProcess::initmysql_result(connectionPool *connPool)
     }
 }
 
+void requestProcess::append_data(const DataPacket &data)
+{
+    m_lock_datas.lock();
+    m_datas.emplace_back(data);
+    m_lock_datas.unlock();
+}
+
 requestProcess::RESULT_CODE requestProcess::process_read()
 {
     LINE_STATUS linestatus = LINE_OK; //记录当前行的读取状态
@@ -285,7 +328,7 @@ requestProcess::RESULT_CODE requestProcess::process_read()
         text = get_line();            // start_line是行在buffer中 的起始位置
         m_start_line = m_checked_idx; //记录下一行的起始位置
 
-        LOG_INFO("%s", text);
+        LOG_INFO("get datas:\n%s", text);
         Log::get_instance()->flush();
 
         switch (m_check_state)
@@ -323,40 +366,44 @@ requestProcess::RESULT_CODE requestProcess::process_read()
     return NO_REQUEST;
 }
 
-bool requestProcess::process_write(RESULT_CODE ret)
+bool requestProcess::process_write()
 {
-    //("process_write %d\n", ret);
-    switch (ret)
+    m_lock_isProcessWrite.lock();
+    if (isProcessWrite) //如果有线程在处理
     {
-    case GET_REQUEST:
-        add_status_line(m_response_status);
-        add_headers(m_response_content_len);
-        if (!add_content(m_response_content))
-        {
-            return false;
-        }
-        break;
-    case INTERNAL_ERROR:
-        add_status_line("SWR");
-        add_headers(0);
-        if (!add_content(""))
-        {
-            return false;
-        }
-        break;
-    case BAD_REQUEST:
-        add_status_line("BRQ");
-        add_headers(0);
-        if (!add_content(""))
-        {
-            return false;
-        }
-        break;
-
-    default:
-        return false;
+        m_threadpool->append(this, 1); //重新扔回线程池队列
+        m_lock_isProcessWrite.unlock();
+        return true;
     }
-    m_bytes_to_send = m_write_idx;
+    isProcessWrite = true;
+    m_lock_isProcessWrite.unlock();
+
+    while (true)
+    {
+        m_lock_datas.lock();
+        if (m_datas.empty())
+        {
+            m_lock_datas.unlock();
+            break;
+        }
+        DataPacket data(m_datas.front());
+        m_datas.pop_front();
+
+        m_lock_datas.unlock();
+
+        add_status_line(ReqToString(data.category));
+        add_headers(data.content_len);
+        if (!add_content(data.content))
+        {
+            return false;
+        }
+        m_bytes_to_send = m_write_idx;
+    }
+
+    m_lock_isProcessWrite.lock();
+    isProcessWrite = false;
+    m_lock_isProcessWrite.unlock();
+
     return true;
 }
 
@@ -375,6 +422,22 @@ requestProcess::RESULT_CODE requestProcess::parse_request_line(char *text)
     else if (strcasecmp(method, "RGT") == 0)
     {
         m_method = RGT;
+    }
+    else if (strcasecmp(method, "LGT") == 0)
+    {
+        m_method = LGT;
+    }
+    else if (strcasecmp(method, "SCU") == 0)
+    {
+        m_method = SCU;
+    }
+    else if (strcasecmp(method, "ADF") == 0)
+    {
+        m_method = ADF;
+    }
+    else if (strcasecmp(method, "RFR") == 0)
+    {
+        m_method = RFR;
     }
     else
     {
@@ -446,9 +509,7 @@ requestProcess::RESULT_CODE requestProcess::do_request()
     switch (m_method)
     {
     case HBT:
-        strcpy(m_response_status, "HBT");
-        m_response_content_len = m_content_length;
-        strncpy(m_response_content, m_string, m_content_length);
+        heartbeat();
         break;
     case LGN:
         login();
@@ -458,6 +519,15 @@ requestProcess::RESULT_CODE requestProcess::do_request()
         break;
     case LGT:
         logout();
+        break;
+    case SCU:
+        search_user();
+        break;
+    case ADF:
+        add_friend();
+        break;
+    case RFR:
+        reply_friend_request();
         break;
     default:
         break;
@@ -571,6 +641,12 @@ bool requestProcess::add_blank_line()
     return add_response("%s", "\r\n");
 }
 
+void requestProcess::heartbeat()
+{
+    append_data(DataPacket(HBT, m_content_length, m_string));
+    m_threadpool->append(this, 1);
+}
+
 void requestProcess::login()
 {
     int l = strlen(m_string);
@@ -581,9 +657,8 @@ void requestProcess::login()
     //如果超出36个字符，说明不合法
     if (l > 36)
     {
-        strcpy(m_response_status, "LGN");
-        m_response_content_len = 4;
-        strcpy(m_response_content, "-2\r\n");
+        append_data(DataPacket(LGN, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
         return;
     }
 
@@ -614,7 +689,7 @@ void requestProcess::login()
 
     bool isNice = true;
 
-    if (username.length() > 16 || password.length() > 16)
+    if (username.length() > 16 || username == "" || password.length() > 16 || password == "")
     {
         isNice = false;
     }
@@ -637,13 +712,12 @@ void requestProcess::login()
     }
     if (!isNice)
     {
-        strcpy(m_response_status, "LGN");
-        m_response_content_len = 4;
-        strcpy(m_response_content, "-2\r\n");
+        append_data(DataPacket(LGN, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
         return;
     }
 
-    m_lock.lock();
+    lock.lock();
 
     auto it = user_mp.find(username);
 
@@ -651,18 +725,15 @@ void requestProcess::login()
     {
         m_sessionID = 0;
 
-        strcpy(m_response_status, "LGN");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "0\r\n");
+        append_data(DataPacket(LGN, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
     }
     else if (userfd_mp.find(username) != userfd_mp.end()) //用户在线
     {
         m_sessionID = -1;
 
-        strcpy(m_response_status, "LGN");
-
-        m_response_content_len = 4;
-        strcpy(m_response_content, "-1\r\n");
+        append_data(DataPacket(LGN, 4, "-1\r\n"));
+        m_threadpool->append(this, 1);
     }
     else
     {
@@ -672,12 +743,11 @@ void requestProcess::login()
         sessionID_mp[m_sessionID] = username;
         userfd_mp[username] = m_sockfd;
 
-        strcpy(m_response_status, "LGN");
-        m_response_content_len = to_string(m_sessionID).length() + 2;
-        strcpy(m_response_content, (to_string(m_sessionID) + "\r\n").c_str());
+        append_data(DataPacket(LGN, int(to_string(m_sessionID).length() + 2), (to_string(m_sessionID) + "\r\n").c_str()));
+        m_threadpool->append(this, 1);
     }
 
-    m_lock.unlock();
+    lock.unlock();
 
     LOG_INFO("sessionID:%lld", m_sessionID);
     Log::get_instance()->flush();
@@ -691,9 +761,8 @@ void requestProcess::regis()
     //如果超出36个字符，说明不合法
     if (l > 36)
     {
-        strcpy(m_response_status, "RGT");
-        m_response_content_len = 4;
-        strcpy(m_response_content, "-2\r\n");
+        append_data(DataPacket(RGT, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
         return;
     }
 
@@ -724,7 +793,7 @@ void requestProcess::regis()
     //判断用户名和密码是否合法
     bool isNice = true;
 
-    if (username.length() > 16 || password.length() > 16)
+    if (username.length() > 16 || username == "" || password.length() > 16 || password == "")
     {
         isNice = false;
     }
@@ -747,21 +816,19 @@ void requestProcess::regis()
     }
     if (!isNice)
     {
-        strcpy(m_response_status, "RGT");
-        m_response_content_len = 4;
-        strcpy(m_response_content, "-2\r\n");
+        append_data(DataPacket(RGT, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
         return;
     }
 
-    m_lock.lock();
+    lock.lock();
 
     auto it = user_mp.find(username);
 
     if (it != user_mp.end()) //用户名被占用
     {
-        strcpy(m_response_status, "RGT");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "0\r\n");
+        append_data(DataPacket(RGT, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
     }
     else
     {
@@ -773,43 +840,333 @@ void requestProcess::regis()
         int res = mysql_query(mysql, sql_insert.c_str());
         user_mp.insert(pair<string, string>(username, password));
 
-        strcpy(m_response_status, "RGT");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "1\r\n");
+        append_data(DataPacket(RGT, 3, "1\r\n"));
+        m_threadpool->append(this, 1);
 
         LOG_INFO("register:%s", username.c_str());
         Log::get_instance()->flush();
     }
 
-    m_lock.unlock();
+    lock.unlock();
 }
 
 void requestProcess::logout()
 {
     if (m_sessionID <= 0)
     {
-        strcpy(m_response_status, "LGT");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "0\r\n");
+        append_data(DataPacket(LGT, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
         return;
     }
 
-    m_lock.lock();
+    lock.lock();
     auto it = sessionID_mp.find(m_sessionID);
 
     if (it == sessionID_mp.end())
     {
-        strcpy(m_response_status, "LGT");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "0\r\n");
+        append_data(DataPacket(LGT, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
     }
     else
     {
+        userfd_mp.erase(sessionID_mp[m_sessionID]);
         sessionID_mp.erase(it);
-        strcpy(m_response_status, "LGT");
-        m_response_content_len = 3;
-        strcpy(m_response_content, "1\r\n");
+
+        append_data(DataPacket(LGT, 3, "1\r\n"));
+        m_threadpool->append(this, 1);
     }
 
-    m_lock.unlock();
+    lock.unlock();
+}
+
+//处理搜索用户逻辑
+void requestProcess::search_user()
+{
+    int l = strlen(m_string);
+
+    //如果超出18个字符，说明不合法
+    if (l > 18)
+    {
+        append_data(DataPacket(SCU, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    //解析用户名
+    string username = "";
+    for (int i = 0; i < l - 1; i++)
+    {
+        if (m_string[i] == '\r' && m_string[i + 1] == '\n')
+        {
+            break;
+        }
+        username += m_string[i];
+    }
+
+    //判断用户名是否合法
+    bool isNice = true;
+
+    if (username.length() > 16 || username == "")
+    {
+        isNice = false;
+    }
+    else
+    {
+        for (const auto &c : username)
+        {
+            if (!isdigit(c) && !isalpha(c))
+            {
+                isNice = false;
+            }
+        }
+    }
+    if (!isNice)
+    {
+        append_data(DataPacket(SCU, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    lock.lock();
+
+    auto it = user_mp.find(username);
+
+    if (it != user_mp.end()) //用户名存在
+    {
+        append_data(DataPacket(SCU, 3, "1\r\n"));
+        m_threadpool->append(this, 1);
+    }
+    else
+    {
+        append_data(DataPacket(SCU, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
+    }
+
+    lock.unlock();
+}
+
+//处理添加好友逻辑
+void requestProcess::add_friend()
+{
+
+    int l = strlen(m_string);
+
+    //如果超出18个字符，说明不合法
+    if (l > 18)
+    {
+        append_data(DataPacket(ADF, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    //解析用户名
+    string tar_user = "";
+    for (int i = 0; i < l - 1; i++)
+    {
+        if (m_string[i] == '\r' && m_string[i + 1] == '\n')
+        {
+            break;
+        }
+        tar_user += m_string[i];
+    }
+
+    //判断用户名是否合法
+    bool isNice = true;
+
+    if (tar_user.length() > 16 || tar_user == "")
+    {
+        isNice = false;
+    }
+    else
+    {
+        for (const auto &c : tar_user)
+        {
+            if (!isdigit(c) && !isalpha(c))
+            {
+                isNice = false;
+            }
+        }
+    }
+    if (!isNice)
+    {
+        append_data(DataPacket(ADF, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    LOG_INFO("user %s apply to add user %s", m_username.c_str(), tar_user.c_str());
+    Log::get_instance()->flush();
+
+    if (tar_user == m_username) //不能添加自己为好友
+    {
+        append_data(DataPacket(ADF, 4, "-3\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    lock.lock();
+
+    auto it = user_mp.find(tar_user);
+    if (it != user_mp.end()) //用户名存在
+    {
+        if (friend_mp[tar_user].count(m_username) == 0) //两人不是好友关系
+        {
+            if (frireq_mp[tar_user].count(m_username) == 0) //没有重复发送好友申请
+            {
+                if (frireq_mp[m_username].count(tar_user) == 0) //目标用户没有向本用户发送申请
+                {
+                    frireq_mp[tar_user].insert(m_username);
+                    append_data(DataPacket(ADF, 3, "1\r\n"));
+                    m_threadpool->append(this, 1);
+
+                    auto it_tar_user = userfd_mp.find(tar_user);
+
+                    if (it_tar_user != userfd_mp.end()) //用户在线
+                    {
+                        m_users[it_tar_user->second].append_data(DataPacket(RFR, m_username.length() + 2, (m_username + "\r\n").c_str()));
+                        m_threadpool->append(m_users + it_tar_user->second, 1);
+                    }
+                    else
+                    {
+                        // MYSQLDebug
+                    }
+                }
+                else //目标用户已经向本用户发送了好友请求
+                {
+                    append_data(DataPacket(ADF, 3, "3\r\n"));
+                    m_threadpool->append(this, 1);
+                }
+            }
+            else //已经发过好友申请
+            {
+                append_data(DataPacket(ADF, 4, "-1\r\n"));
+                m_threadpool->append(this, 1);
+            }
+        }
+        else //两人已经是好友
+        {
+            append_data(DataPacket(ADF, 3, "2\r\n"));
+            m_threadpool->append(this, 1);
+        }
+    }
+    else //用户名不存在
+    {
+        append_data(DataPacket(ADF, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
+    }
+
+    lock.unlock();
+}
+
+//处理回复好友申请逻辑
+void requestProcess::reply_friend_request()
+{
+
+    int l = strlen(m_string);
+
+    string username = "";
+    char choose = '\0';
+
+    //如果超出21个字符，说明不合法
+    if (l > 21)
+    {
+        return;
+    }
+
+    //解析用户名和选择
+    int lineCnt = 0;
+    for (int i = 0; i < l - 1; i++)
+    {
+        if (m_string[i] == '\r' && m_string[i + 1] == '\n')
+        {
+            lineCnt++;
+            i++;
+            continue;
+        }
+        switch (lineCnt)
+        {
+        case 0:
+            username += m_string[i];
+            break;
+        case 1:
+            choose = m_string[i];
+            break;
+        default:
+            break;
+        }
+    }
+
+    //判断用户名和选择是否合法
+
+    bool isNice = true;
+
+    if (username.length() > 16 || username == "")
+    {
+        isNice = false;
+    }
+    else
+    {
+        for (const auto &c : username)
+        {
+            if (!isdigit(c) && !isalpha(c))
+            {
+                isNice = false;
+            }
+        }
+    }
+    if (!isNice)
+    {
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    lock.lock();
+
+    if (frireq_mp[m_username].count(username) == 1) //存在好友申请
+    {
+        if (choose == '1') //接受好友申请
+        {
+            if (friend_mp[m_username].count(username) == 0) //已经是好友
+            {
+                friend_mp[m_username].insert(username);
+                friend_mp[username].insert(m_username);
+            }
+        }
+        else //拒绝好友申请
+        {
+        }
+
+        frireq_mp[m_username].erase(username);
+    }
+
+    lock.unlock();
+
+    LOG_INFO("user %s %s user %s friend requset.", m_username.c_str(), (choose == '1' ? "accept" : "reject"), username.c_str());
+    Log::get_instance()->flush();
+}
+
+const char *requestProcess::ReqToString(requestProcess::REQUEST r)
+{
+    switch (r)
+    {
+    case HBT:
+        return "HBT";
+    case LGN:
+        return "LGN";
+    case RGT:
+        return "RGT";
+    case LGT:
+        return "LGT";
+    case SCU:
+        return "SCU";
+    case ADF:
+        return "ADF";
+    case RFR:
+        return "RFR";
+    default:
+        return "ERR";
+    }
 }
