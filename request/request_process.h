@@ -43,6 +43,7 @@ public:
     SCU表示查找用户请求；
     ADF表示添加好友请求；
     RFR表示回复好友请求；
+    RCN表示重连请求；
     */
     enum REQUEST
     {
@@ -53,6 +54,7 @@ public:
         SCU,
         ADF,
         RFR,
+        RCN,
     };
 
     //主状态机的两种可能状态，分别表示：当前正在分析请求行，当前正在分析内容
@@ -96,7 +98,7 @@ public:
     void init(int sockfd, const sockaddr_in &addr, connectionPool *connPool, int listenfd_Trig_mode, int connfd_Trig_mode);
 
     //关闭连接
-    void close_conn(bool real_close = true);
+    void close_conn(bool real_close = true, bool wantLogout = false);
 
     //处理客户端请求
     void process(int mode);
@@ -164,6 +166,8 @@ private:
     void add_friend();
     //处理回复好友申请逻辑
     void reply_friend_request();
+    //处理重连逻辑
+    void reconnect();
 
     // REQUEST转const char*
     const char *ReqToString(REQUEST r);
@@ -212,7 +216,7 @@ private:
     CHECK_STATE m_check_state;
 
     //客户的sessionID
-    long long m_sessionID;
+    string m_sessionID;
 
     //请求方法
     REQUEST m_method;

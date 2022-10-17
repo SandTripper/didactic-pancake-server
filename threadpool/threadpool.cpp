@@ -50,8 +50,8 @@ bool threadpool::append(requestProcess *request, int mode)
         return false;
     }
 
-    LOG_INFO("append a work mode = %d", mode);
-    Log::get_instance()->flush();
+    // LOG_INFO("append a work mode = %d", mode);
+    // Log::get_instance()->flush();
 
     m_workqueue.emplace_back(pair<requestProcess *, int>(request, mode));
     m_queuelocker.unlock();

@@ -285,7 +285,7 @@ int main(int argc, char *argv[])
                 }
                 else //关闭连接
                 {
-                    users[sockfd].close_conn();
+                    users[sockfd].close_conn(true, true);
                     LOG_INFO("close fd %d", sockfd);
                     Log::get_instance()->flush();
                 }
@@ -302,7 +302,7 @@ int main(int argc, char *argv[])
                 }
                 else //关闭连接
                 {
-                    users[sockfd].close_conn();
+                    users[sockfd].close_conn(true, true);
                     LOG_INFO("close fd %d", sockfd);
                     Log::get_instance()->flush();
                 }
