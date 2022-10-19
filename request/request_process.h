@@ -36,15 +36,19 @@ public:
     static const int WRITE_BUFFER_SIZE = 1024;
 
     /*请求类型
-    HBT表示发送心跳包；
-    LGN表示登录请求；
-    RGT表示注册请求；
-    LGT表示登出请求；
-    SCU表示查找用户请求；
-    ADF表示添加好友请求；
-    RFR表示回复好友请求；
-    RCN表示重连请求；
-    */
+     HBT表示发送心跳包；
+     LGN表示登录请求；
+     RGT表示注册请求；
+     LGT表示登出请求；
+     SCU表示查找用户请求；
+     ADF表示添加好友请求；
+     DEF表示删除好友；
+     RFR表示回复好友请求；
+     RCN表示重连请求；
+     GFI表示获取好友列表请求；
+     AFI表示增加好友；
+     DFI表示去除好友；
+     */
     enum REQUEST
     {
         HBT = 0,
@@ -53,8 +57,12 @@ public:
         LGT,
         SCU,
         ADF,
+        DEF,
         RFR,
         RCN,
+        GFI,
+        AFI,
+        DFI,
     };
 
     //主状态机的两种可能状态，分别表示：当前正在分析请求行，当前正在分析内容
@@ -164,10 +172,14 @@ private:
     void search_user();
     //处理添加好友逻辑
     void add_friend();
+    //处理删除好友逻辑
+    void delete_friend();
     //处理回复好友申请逻辑
     void reply_friend_request();
     //处理重连逻辑
     void reconnect();
+    //处理获取好友列表
+    void get_friend_items();
 
     // REQUEST转const char*
     const char *ReqToString(REQUEST r);

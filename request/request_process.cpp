@@ -441,6 +441,10 @@ requestProcess::RESULT_CODE requestProcess::parse_request_line(char *text)
     {
         m_method = ADF;
     }
+    else if (strcasecmp(method, "DEF") == 0)
+    {
+        m_method = DEF;
+    }
     else if (strcasecmp(method, "RFR") == 0)
     {
         m_method = RFR;
@@ -448,6 +452,18 @@ requestProcess::RESULT_CODE requestProcess::parse_request_line(char *text)
     else if (strcasecmp(method, "RCN") == 0)
     {
         m_method = RCN;
+    }
+    else if (strcasecmp(method, "GFI") == 0)
+    {
+        m_method = GFI;
+    }
+    else if (strcasecmp(method, "AFI") == 0)
+    {
+        m_method = AFI;
+    }
+    else if (strcasecmp(method, "DFI") == 0)
+    {
+        m_method = DFI;
     }
     else
     {
@@ -536,11 +552,21 @@ requestProcess::RESULT_CODE requestProcess::do_request()
     case ADF:
         add_friend();
         break;
+    case DEF:
+        delete_friend();
+        break;
     case RFR:
         reply_friend_request();
         break;
     case RCN:
         reconnect();
+        break;
+    case GFI:
+        get_friend_items();
+        break;
+    case AFI:
+        break;
+    case DFI:
         break;
     default:
         break;
@@ -1159,10 +1185,14 @@ void requestProcess::reply_friend_request()
     {
         if (choose == '1') //接受好友申请
         {
-            if (friend_mp[m_username].count(username) == 0) //已经是好友
+            if (friend_mp[m_username].count(username) == 0) //不是好友
             {
                 friend_mp[m_username].insert(username);
                 friend_mp[username].insert(m_username);
+                append_data(DataPacket(AFI, username.length() + 2, (username + "\r\n").c_str()));
+                m_threadpool->append(this, 1);
+                m_users[userfd_mp[username]].append_data(DataPacket(AFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
+                m_threadpool->append(m_users + userfd_mp[username], 1);
             }
         }
         else //拒绝好友申请
@@ -1256,6 +1286,111 @@ void requestProcess::reconnect()
     }
 }
 
+void requestProcess::get_friend_items()
+{
+    if (m_sessionID == "") //没有权限
+    {
+        append_data(DataPacket(GFI, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    string content = "";
+    lock.lock();
+
+    for (const auto &fri : friend_mp[m_username])
+    {
+        content += fri + "\r\n";
+    }
+
+    append_data(DataPacket(GFI, content.length(), content.c_str()));
+    m_threadpool->append(this, 1);
+
+    lock.unlock();
+
+    LOG_INFO("user %s get friend items", m_username.c_str());
+    Log::get_instance()->flush();
+}
+
+void requestProcess::delete_friend()
+{
+    if (m_sessionID == "") //没有权限
+    {
+        append_data(DataPacket(DEF, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    int l = strlen(m_string);
+
+    string username = "";
+
+    //如果超出18个字符，说明不合法
+    if (l > 18)
+    {
+        append_data(DataPacket(RCN, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+    //解析username
+    for (int i = 0; i < l - 1; i++)
+    {
+        if (m_string[i] == '\r' && m_string[i + 1] == '\n')
+        {
+            i++;
+            continue;
+        }
+        username += m_string[i];
+    }
+
+    //判断username是否合法
+
+    bool isNice = true;
+
+    if (username.length() > 16 || username == "")
+    {
+        isNice = false;
+    }
+    else
+    {
+        for (const auto &c : username)
+        {
+            if (!isdigit(c) && !isalpha(c))
+            {
+                isNice = false;
+            }
+        }
+    }
+    if (!isNice)
+    {
+        append_data(DataPacket(DEF, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    lock.lock();
+
+    if (friend_mp[m_username].count(username) != 0) //确实有好友关系
+    {
+        friend_mp[m_username].erase(username);
+        friend_mp[username].erase(m_username);
+
+        append_data(DataPacket(DFI, username.length() + 2, (username + "\r\n").c_str()));
+        m_threadpool->append(this, 1);
+        m_users[userfd_mp[username]].append_data(DataPacket(DFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
+        m_threadpool->append(m_users + userfd_mp[username], 1);
+    }
+
+    lock.unlock();
+
+    LOG_INFO("user %s delete friend %s", m_username.c_str(), username.c_str());
+    Log::get_instance()->flush();
+}
+
 const char *requestProcess::ReqToString(requestProcess::REQUEST r)
 {
     switch (r)
@@ -1272,10 +1407,18 @@ const char *requestProcess::ReqToString(requestProcess::REQUEST r)
         return "SCU";
     case ADF:
         return "ADF";
+    case DEF:
+        return "DEF";
     case RFR:
         return "RFR";
     case RCN:
         return "RCN";
+    case GFI:
+        return "GFI";
+    case AFI:
+        return "AFI";
+    case DFI:
+        return "DFI";
     default:
         return "ERR";
     }
