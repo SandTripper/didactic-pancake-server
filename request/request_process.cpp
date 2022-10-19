@@ -146,15 +146,11 @@ void requestProcess::close_conn(bool real_close, bool wantLogout)
         m_user_count--; //关闭一个连接时，将客户总量减1
         if (wantLogout)
         {
-            lock.lock();
-            auto it = sessionID_mp.find(m_sessionID);
-            if (it != sessionID_mp.end())
-            {
-                userfd_mp.erase(sessionID_mp[m_sessionID]);
-                sessionID_mp.erase(it);
-            }
-            lock.unlock();
+            logout();
         }
+
+        LOG_INFO("close fd %d", m_epollfd);
+        Log::get_instance()->flush();
     }
 }
 
@@ -887,29 +883,19 @@ void requestProcess::logout()
 {
     if (m_sessionID == "")
     {
-        append_data(DataPacket(LGT, 3, "0\r\n"));
-        m_threadpool->append(this, 1);
         return;
     }
 
     lock.lock();
     auto it = sessionID_mp.find(m_sessionID);
 
-    if (it == sessionID_mp.end())
-    {
-        append_data(DataPacket(LGT, 3, "0\r\n"));
-        m_threadpool->append(this, 1);
-    }
-    else
+    if (it != sessionID_mp.end())
     {
         LOG_INFO("user %s logout", it->second.c_str());
         Log::get_instance()->flush();
 
         userfd_mp.erase(sessionID_mp[m_sessionID]);
         sessionID_mp.erase(it);
-
-        append_data(DataPacket(LGT, 3, "1\r\n"));
-        m_threadpool->append(this, 1);
     }
 
     lock.unlock();

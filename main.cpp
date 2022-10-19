@@ -1,12 +1,14 @@
 #include "locker/locker.h"
 #include "threadpool/threadpool.h"
 #include "request/request_process.h"
+#include "./timer/time_wheel_timer.h"
 #include "./sqlconnpool/sql_connection_pool.h"
 #include "./log/log.h"
 #include "config/config.h"
 
 #define MAX_FD 65536           //最大文件描述符
 #define MAX_EVENT_NUMBER 10000 //最大事件数
+#define TIMESLOT 5             //最小超时单位
 
 //这三个函数在request_process.cpp中定义，改变链接属性
 extern int addfd(int epollfd, int fd, bool oneshot, int triggermode);
@@ -15,7 +17,7 @@ extern int setnonblocking(int fd);
 
 //设置定时器相关参数
 static int pipefd[2];
-// static time_wheel time_whl;
+static time_wheel time_whl;
 static int epollfd = 0;
 
 //信号处理函数
@@ -40,6 +42,19 @@ void addsig(int sig, void(handler)(int), bool restart = true)
     }
     sigfillset(&sa.sa_mask);
     assert(sigaction(sig, &sa, NULL) != -1);
+}
+
+//定时处理任务，重新定时以不断触发SIGALRM信号
+void timer_handler()
+{
+    time_whl.tick();
+    alarm(time_whl.SI);
+}
+
+//定时器回调函数，删除非活动在socket上的注册事件，并关闭
+void cb_func(client_data *user)
+{
+    (requestProcess::m_users + user->sockfd)->close_conn(true, true);
 }
 
 void show_error(int connfd, const char *info)
@@ -182,7 +197,10 @@ int main(int argc, char *argv[])
 
     bool stop_server = false;
 
+    client_data *users_timer = new client_data[MAX_FD];
+
     bool timeout = false; //记录有没有SIGALRM信号待处理
+    alarm(time_whl.SI);
 
     while (!stop_server)
     {
@@ -217,6 +235,14 @@ int main(int argc, char *argv[])
                     }
                     //初始化客户连接
                     users[connfd].init(connfd, client_address, connPool, listenfd_Trig_mode, connfd_Trig_mode);
+
+                    //初始化client_data数据，添加定时器，设置回调函数，绑定用户数据
+                    users_timer[connfd].address = client_address;
+                    users_timer[connfd].sockfd = connfd;
+                    tw_timer *timer = time_whl.add_timer(6 * TIMESLOT);
+                    users_timer[connfd].timer = timer;
+                    timer->cb_func = cb_func;
+                    timer->user_data = &users_timer[connfd];
                 }
                 else
                 {
@@ -237,12 +263,29 @@ int main(int argc, char *argv[])
                         }
                         //初始化客户连接
                         users[connfd].init(connfd, client_address, connPool, listenfd_Trig_mode, connfd_Trig_mode);
+
+                        //初始化client_data数据，添加定时器，设置回调函数，绑定用户数据
+                        users_timer[connfd].address = client_address;
+                        users_timer[connfd].sockfd = connfd;
+                        time_t cur = time(NULL);
+                        tw_timer *timer = time_whl.add_timer(6 * TIMESLOT);
+                        users_timer[connfd].timer = timer;
+                        timer->cb_func = cb_func;
+                        timer->user_data = &users_timer[connfd];
                     }
                     continue;
                 }
             }
             else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
             {
+                //服务器端关闭连接，移除对应的定时器
+                tw_timer *timer = users_timer[sockfd].timer;
+                timer->cb_func(&users_timer[sockfd]);
+
+                if (timer)
+                {
+                    time_whl.del_timer(timer);
+                }
             }
             else if ((sockfd == pipefd[0]) && (events[i].events & EPOLLIN))
             {
@@ -276,22 +319,37 @@ int main(int argc, char *argv[])
             //处理客户连接上接收到的数据
             else if (events[i].events & EPOLLIN)
             {
+                tw_timer *timer = users_timer[sockfd].timer;
                 //根据读的结果，决定是将任务添加到线程池，还是要关闭连接
                 if (users[sockfd].read())
                 {
                     LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
                     Log::get_instance()->flush();
                     pool->append(users + sockfd, 0);
+
+                    //有数据传输，将定时器往后延迟
+                    if (timer)
+                    {
+                        time_t cur = time(NULL);
+                        time_whl.del_timer(timer);
+                        timer = time_whl.add_timer(TIMESLOT * 6);
+                        users_timer[sockfd].timer = timer;
+                        timer->cb_func = cb_func;
+                        timer->user_data = &users_timer[sockfd];
+                    }
                 }
                 else //关闭连接
                 {
-                    users[sockfd].close_conn(true, true);
-                    LOG_INFO("close fd %d", sockfd);
-                    Log::get_instance()->flush();
+                    timer->cb_func(&users_timer[sockfd]);
+                    if (timer)
+                    {
+                        time_whl.del_timer(timer);
+                    }
                 }
             }
             else if (events[i].events & EPOLLOUT)
             {
+                tw_timer *timer = users_timer[sockfd].timer;
 
                 LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
                 Log::get_instance()->flush();
@@ -299,18 +357,34 @@ int main(int argc, char *argv[])
                 //根据写的结果，决定是否关闭连接
                 if (users[sockfd].write())
                 {
+                    //有数据传输，将定时器往后延迟
+                    if (timer)
+                    {
+                        time_t cur = time(NULL);
+                        time_whl.del_timer(timer);
+                        timer = time_whl.add_timer(TIMESLOT * 6);
+                        users_timer[sockfd].timer = timer;
+                        timer->cb_func = cb_func;
+                        timer->user_data = &users_timer[sockfd];
+
+                        LOG_INFO("%s", "adjust timer once");
+                        Log::get_instance()->flush();
+                    }
                 }
                 else //关闭连接
                 {
-                    users[sockfd].close_conn(true, true);
-                    LOG_INFO("close fd %d", sockfd);
-                    Log::get_instance()->flush();
+                    timer->cb_func(&users_timer[sockfd]);
+                    if (timer)
+                    {
+                        time_whl.del_timer(timer);
+                    }
                 }
             }
         }
         //最后处理定时时间
         if (timeout)
         {
+            timer_handler();
             timeout = false;
         }
     }
@@ -319,6 +393,7 @@ int main(int argc, char *argv[])
     close(pipefd[1]);
     close(pipefd[0]);
     delete[] users;
+    delete[] users_timer;
     delete pool;
     return 0;
 }
