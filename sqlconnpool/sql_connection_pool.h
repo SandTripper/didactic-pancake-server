@@ -17,7 +17,7 @@ public:
     //释放连接
     bool release_connection(MYSQL *connection);
 
-    //获取连接
+    //获取空闲连接数量
     int get_free_connection();
 
     //销毁数据库连接池
@@ -41,7 +41,7 @@ private:
     //主机地址
     std::string m_url;
     //数据库端口号
-    std::string m_port;
+    int m_port;
     //登录数据库用户名
     std::string m_user;
     //登录数据库密码

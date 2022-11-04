@@ -35,7 +35,7 @@ public:
     //写缓冲区的大小
     static const int WRITE_BUFFER_SIZE = 1024;
 
-    /*请求类型
+    /*数据包类型
      HBT表示发送心跳包；
      LGN表示登录请求；
      RGT表示注册请求；
@@ -48,8 +48,12 @@ public:
      GFI表示获取好友列表请求；
      AFI表示增加好友；
      DFI表示去除好友；
+     SMA表示发送消息；
+     RMA表示接收消息；
+     RDY表示客户端就绪；
+     IGN：服务器独有，用于表示发送到一半的数据包
      */
-    enum REQUEST
+    enum PACKET_TYPE
     {
         HBT = 0,
         LGN,
@@ -63,17 +67,27 @@ public:
         GFI,
         AFI,
         DFI,
+        SMA,
+        RMA,
+        RDY,
+        IGN
     };
 
-    //主状态机的两种可能状态，分别表示：当前正在分析请求行，当前正在分析内容
+    /*主状态机的三种可能状态
+    CHECK_STATE_TYPELINE 表示当前正在分析状态行；
+    CHECK_STATE_HEADER 表示当前正在头部字段；
+    CHECK_STATE_CONTENT 表示当前正在分析正文*/
     enum CHECK_STATE
     {
-        CHECK_STATE_REQUESTLINE = 0,
+        CHECK_STATE_TYPELINE = 0,
         CHECK_STATE_HEADER,
         CHECK_STATE_CONTENT,
     };
 
-    //行的读取状态，分别表示：读取到一个完整的行，行出错，行数据尚且不完整
+    /*行的读取状态
+    LINE_OK 表示读取到一个完整的行；
+    LINE_BAD 表示行出错；
+    LINE_OPEN 表示行数据尚且不完整*/
     enum LINE_STATUS
     {
         LINE_OK = 0,
@@ -81,12 +95,12 @@ public:
         LINE_OPEN,
     };
 
-    /*服务器处理请求的结果：
-    NO_REQUEST表示请求不完整，需要继续读取客户数据：
-    GET_REQUEST表示获得了一个完整的的客户请求；
-    BAD_REQUSET表示客户请求有语法错误；
-    INTERNAL_ERROR表示服务器内部错误；
-    CLOSED_CONNECTION表示客户端已经关闭连接*/
+    /*处理数据包的结果：
+    NO_REQUEST表示请求不完整，需要继续读取数据包：
+    GET_REQUEST表示获得了一个完整的数据包；
+    BAD_REQUSET表示数据包有语法错误；
+    INTERNAL_ERROR表示内部错误；
+    CLOSED_CONNECTION连接断开*/
     enum RESULT_CODE
     {
         NO_REQUEST = 0,
@@ -102,13 +116,13 @@ public:
     ~requestProcess();
 
 public:
-    //初始化新接受的链接
+    //初始化新接受的连接
     void init(int sockfd, const sockaddr_in &addr, connectionPool *connPool, int listenfd_Trig_mode, int connfd_Trig_mode);
 
-    //关闭连接
-    void close_conn(bool real_close = true, bool wantLogout = false);
+    //关闭连接,并决定是否登出
+    void close_conn(bool wantLogout = false);
 
-    //处理客户端请求
+    //工作线程函数
     void process(int mode);
 
     //非阻塞读操作
@@ -123,8 +137,11 @@ public:
     //初始化数据库，读出到map
     void initmysql_result(connectionPool *connPool);
 
-    //往待发送数组里添加数据包
-    void append_data(const DataPacket &data);
+    //往待发送链表头部添加数据包
+    void append_front_data(const DataPacket &data);
+
+    //往待发送链表尾部添加数据包
+    void append_back_data(const DataPacket &data);
 
 private:
     //初始化连接
@@ -136,22 +153,21 @@ private:
     //初始化写
     void init_write();
 
-    //解析请求
+    //解析数据包
     RESULT_CODE process_read();
 
-    //填充应答
-    bool process_write();
+    //生成数据包
+    void process_write();
 
-    //下面这一组函数被process_read调用以分析请求
-    RESULT_CODE parse_request_line(char *text);
+    //下面这一组函数被process_read调用以解析数据包
+    RESULT_CODE parse_type_line(char *text);
     RESULT_CODE parse_headers(char *text);
     RESULT_CODE parse_content(char *text);
     RESULT_CODE do_request();
     char *get_line();
     LINE_STATUS parse_line();
 
-    //下面这一组函数被process_write调用以填充HTTP应答
-    void unmap();
+    //下面这一组函数被process_write调用以生成数据包
     bool add_response(const char *format, ...);
     bool add_content(const char *content);
     bool add_status_line(const char *status);
@@ -180,9 +196,16 @@ private:
     void reconnect();
     //处理获取好友列表
     void get_friend_items();
+    //处理发送消息逻辑
+    void send_message();
+    //处理客户端就绪逻辑
+    void client_ready();
 
     // REQUEST转const char*
-    const char *ReqToString(REQUEST r);
+    const char *ReqToString(PACKET_TYPE r);
+
+    //获取毫秒级别时间戳
+    long long timestamp();
 
 public:
     /*所有socket上的事件都被注册到同一个epoll内核事件表中,
@@ -192,7 +215,7 @@ public:
     //统计用户数量
     static int m_user_count;
 
-    //指向全局唯一连接池实例的指针
+    //指向全局唯一数据库连接池实例的指针
     connectionPool *m_connPool;
 
     //线程池对象
@@ -230,19 +253,22 @@ private:
     //客户的sessionID
     string m_sessionID;
 
-    //请求方法
-    REQUEST m_method;
+    //数据包类型
+    PACKET_TYPE m_method;
 
-    // 请求的消息体的长度
+    // 数据包正文的长度
     int m_content_length;
+
+    //数据包正文已读取的长度
+    int m_content_len_have_read;
+
+    //存储数据包正文
+    char *m_content;
 
     //需要发送的字节数
     int m_bytes_to_send;
     //已经发送的字节数
     int m_bytes_have_send;
-
-    //存储请求头数据
-    char *m_string;
 
     // listenfd是否开启ET模式，ET模式为1，LT模式为0
     int m_listenfd_Trig_mode;
@@ -252,7 +278,7 @@ private:
 
     //当前是否有线程在处理写请求,配一把互斥锁
     mutexLocker m_lock_isProcessWrite;
-    int isProcessWrite;
+    int m_is_process_write;
 
     //待发送的数据包,配一把互斥锁
     mutexLocker m_lock_datas;
@@ -266,35 +292,39 @@ public:
     DataPacket()
     {
         category = requestProcess::HBT;
-        content = NULL;
         content_len = 0;
+        content = NULL;
     }
-    DataPacket(requestProcess::REQUEST cat, const char *con)
+    //传入的字符串以'\0'标识结尾
+    DataPacket(requestProcess::PACKET_TYPE cat, const char *con)
     {
         category = cat;
         content_len = strlen(con);
-        content = new char[content_len];
+        content = new char[content_len + 1];
         strncpy(content, con, content_len);
+        content[content_len] = '\0';
     }
-    DataPacket(requestProcess::REQUEST cat, int conlen, const char *con)
+    DataPacket(requestProcess::PACKET_TYPE cat, int conlen, const char *con)
     {
         category = cat;
         content_len = conlen;
-        content = new char[conlen];
+        content = new char[conlen + 1];
         strncpy(content, con, conlen);
+        content[content_len] = '\0';
     }
     DataPacket(const DataPacket &other)
     {
         category = other.category;
         content_len = other.content_len;
-        content = new char[content_len];
+        content = new char[content_len + 1];
         strncpy(content, other.content, content_len);
+        content[content_len] = '\0';
     }
     ~DataPacket()
     {
         delete[] content;
     }
-    requestProcess::REQUEST category;
+    requestProcess::PACKET_TYPE category;
     int content_len;
     char *content;
 };

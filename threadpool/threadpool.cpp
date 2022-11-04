@@ -40,6 +40,7 @@ threadpool::~threadpool()
     m_stop = true;
 }
 
+//往工作队列添加任务，mode=0为读数据，mode=1为写数据 (线程安全)
 bool threadpool::append(requestProcess *request, int mode)
 {
     //操作工作队列时一定要加锁

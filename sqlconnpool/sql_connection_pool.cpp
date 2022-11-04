@@ -1,4 +1,5 @@
 #include "sql_connection_pool.h"
+#include "../log/log.h"
 
 using namespace std;
 
@@ -34,6 +35,28 @@ MYSQL *connectionPool::connectionPool::get_connection()
     ++m_cur_conn;
 
     m_lock.unlock();
+
+    if (mysql_query(connection, "delete from empty_table") != 0) //如果连接不可用，则重连
+    {
+        connection = mysql_init(connection);
+
+        if (connection == NULL)
+        {
+            printf("Error: %s\n", mysql_error(connection));
+            exit(1);
+        }
+        connection = mysql_real_connect(connection, m_url.c_str(), m_user.c_str(), m_password.c_str(),
+                                        m_database_name.c_str(), m_port, NULL, 0);
+
+        if (connection == NULL)
+        {
+            printf("Error: %s\n", mysql_error(connection));
+            exit(1);
+        }
+
+        LOG_INFO("reconnect a sqlconnect");
+        Log::get_instance()->flush();
+    }
     return connection;
 }
 

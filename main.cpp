@@ -8,7 +8,7 @@
 
 #define MAX_FD 65536           //最大文件描述符
 #define MAX_EVENT_NUMBER 10000 //最大事件数
-#define TIMESLOT 5             //最小超时单位
+#define TIMELIMIT 30           //超时单位
 
 //这三个函数在request_process.cpp中定义，改变链接属性
 extern int addfd(int epollfd, int fd, bool oneshot, int triggermode);
@@ -54,7 +54,7 @@ void timer_handler()
 //定时器回调函数，删除非活动在socket上的注册事件，并关闭
 void cb_func(client_data *user)
 {
-    (requestProcess::m_users + user->sockfd)->close_conn(true, true);
+    (requestProcess::m_users + user->sockfd)->close_conn(true);
 }
 
 void show_error(int connfd, const char *info)
@@ -239,7 +239,7 @@ int main(int argc, char *argv[])
                     //初始化client_data数据，添加定时器，设置回调函数，绑定用户数据
                     users_timer[connfd].address = client_address;
                     users_timer[connfd].sockfd = connfd;
-                    tw_timer *timer = time_whl.add_timer(6 * TIMESLOT);
+                    tw_timer *timer = time_whl.add_timer(TIMELIMIT);
                     users_timer[connfd].timer = timer;
                     timer->cb_func = cb_func;
                     timer->user_data = &users_timer[connfd];
@@ -268,7 +268,7 @@ int main(int argc, char *argv[])
                         users_timer[connfd].address = client_address;
                         users_timer[connfd].sockfd = connfd;
                         time_t cur = time(NULL);
-                        tw_timer *timer = time_whl.add_timer(6 * TIMESLOT);
+                        tw_timer *timer = time_whl.add_timer(TIMELIMIT);
                         users_timer[connfd].timer = timer;
                         timer->cb_func = cb_func;
                         timer->user_data = &users_timer[connfd];
@@ -332,7 +332,7 @@ int main(int argc, char *argv[])
                     {
                         time_t cur = time(NULL);
                         time_whl.del_timer(timer);
-                        timer = time_whl.add_timer(TIMESLOT * 6);
+                        timer = time_whl.add_timer(TIMELIMIT);
                         users_timer[sockfd].timer = timer;
                         timer->cb_func = cb_func;
                         timer->user_data = &users_timer[sockfd];
@@ -351,18 +351,16 @@ int main(int argc, char *argv[])
             {
                 tw_timer *timer = users_timer[sockfd].timer;
 
-                LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
-                Log::get_instance()->flush();
-
                 //根据写的结果，决定是否关闭连接
                 if (users[sockfd].write())
                 {
+
                     //有数据传输，将定时器往后延迟
                     if (timer)
                     {
                         time_t cur = time(NULL);
                         time_whl.del_timer(timer);
-                        timer = time_whl.add_timer(TIMESLOT * 6);
+                        timer = time_whl.add_timer(TIMELIMIT);
                         users_timer[sockfd].timer = timer;
                         timer->cb_func = cb_func;
                         timer->user_data = &users_timer[sockfd];
