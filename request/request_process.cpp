@@ -2,11 +2,16 @@
 
 #include <map>
 #include <set>
+#include <fstream>
+#include <sstream>
+#include <sys/stat.h>
 
 using namespace std;
 
 int requestProcess::m_user_count = 0;
 int requestProcess::m_epollfd = -1;
+
+extern int pipefd[2];
 
 //初始化静态变量
 threadpool *requestProcess::m_threadpool = NULL;
@@ -74,7 +79,6 @@ void modfd(int epollfd, int fd, int ev, int triggermode)
 {
     epoll_event event;
     event.data.fd = fd;
-
     if (triggermode)
     {
         event.events = ev | EPOLLONESHOT | EPOLLRDHUP | EPOLLET;
@@ -133,10 +137,6 @@ void requestProcess::init_read()
 //初始化写
 void requestProcess::init_write()
 {
-    m_bytes_have_send = 0;
-    m_bytes_to_send = 0;
-    m_write_idx = 0;
-    memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
 }
 
 void requestProcess::initmysql_result(connectionPool *connPool)
@@ -270,6 +270,14 @@ void requestProcess::process(int mode)
         }
         else
         {
+            // char buf[5] = {MY_SIGREAD};
+            // int sofd = m_sockfd;
+            // for (int i = 1; i <= 4; i++)
+            // {
+            //     buf[i] = sofd % 256 - 128;
+            //     sofd /= 256;
+            // }
+            // send(pipefd[1], buf, 5, 0);
             modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
         }
     }
@@ -331,7 +339,7 @@ bool requestProcess::read()
 {
     if (m_read_idx >= READ_BUFFER_SIZE)
     {
-        return false;
+        return true;
     }
     int bytes_read = 0;
 
@@ -367,9 +375,9 @@ bool requestProcess::read()
     }
     else // LT模式，直接读取数据
     {
+
         bytes_read = recv(m_sockfd, m_read_buf + m_read_idx,
                           READ_BUFFER_SIZE - m_read_idx, 0);
-
         m_read_idx += bytes_read;
         if (bytes_read <= 0) //返回值小于0，说明recv在copy时出错，返回值等于0，说明客户端断开连接
         {
@@ -501,6 +509,14 @@ requestProcess::RESULT_CODE requestProcess::parse_type_line(char *text)
     {
         m_method = RDY;
     }
+    else if (strcasecmp(method, "SAV") == 0)
+    {
+        m_method = SAV;
+    }
+    else if (strcasecmp(method, "RAV") == 0)
+    {
+        m_method = RAV;
+    }
     else
     {
         return BAD_REQUEST;
@@ -512,6 +528,7 @@ requestProcess::RESULT_CODE requestProcess::parse_type_line(char *text)
 
 requestProcess::RESULT_CODE requestProcess::parse_headers(char *text)
 {
+    Log::get_instance()->flush();
     //遇到空行，表示头部字段解析完毕
     if (text[0] == '\0')
     {
@@ -546,6 +563,7 @@ requestProcess::RESULT_CODE requestProcess::parse_headers(char *text)
 
 requestProcess::RESULT_CODE requestProcess::parse_content(char *text)
 {
+
     if (m_content == nullptr)
     {
         m_content = new char[m_content_length + 1];
@@ -554,7 +572,11 @@ requestProcess::RESULT_CODE requestProcess::parse_content(char *text)
     {
         /*如果当前已读到数据包正文的结尾
         将数据拷贝至m_content并加上'\0'*/
-        strncpy(m_content + m_content_len_have_read, text, m_content_length - m_content_len_have_read);
+
+        LOG_INFO("parse %d gooddata,last %d datas", m_read_idx - m_checked_idx, m_content_length - m_content_len_have_read);
+        Log::get_instance()->flush();
+
+        memcpy(m_content + m_content_len_have_read, text, m_content_length - m_content_len_have_read);
         m_content[m_content_length] = '\0';
         m_checked_idx += m_content_length - m_content_len_have_read;
         m_start_line = m_checked_idx;
@@ -565,10 +587,14 @@ requestProcess::RESULT_CODE requestProcess::parse_content(char *text)
     {
         /*如果当前未读到数据包正文的结尾
         将读到的数据段拷贝至m_content并返回NO_REQUEST等待下次数据*/
-        strncpy(m_content + m_content_len_have_read, text, m_read_idx - m_checked_idx);
+
+        LOG_INFO("parse %d data,last %d datas", m_read_idx - m_checked_idx, m_content_length - m_content_len_have_read);
+        Log::get_instance()->flush();
+
+        memcpy(m_content + m_content_len_have_read, text, m_read_idx - m_checked_idx);
+        m_content_len_have_read += m_read_idx - m_checked_idx;
         m_start_line = m_read_idx;
         m_checked_idx = m_read_idx;
-        m_content_len_have_read += m_read_idx - m_checked_idx;
         return NO_REQUEST;
     }
 }
@@ -619,6 +645,8 @@ requestProcess::RESULT_CODE requestProcess::do_request()
     case RDY:
         client_ready();
         break;
+    case SAV:
+        change_avatar();
     default:
         break;
     }
@@ -637,68 +665,39 @@ void requestProcess::process_write()
     m_is_process_write = true;
     m_lock_isProcessWrite.unlock();
 
-    while (true)
+    m_lock_datas.lock(); //操作数据链表记得加锁
+    if (!m_datas.empty())
     {
-        m_lock_datas.lock(); //操作数据链表记得加锁
-        if (m_datas.empty())
-        {
-            m_lock_datas.unlock(); //跳出循环之前记得释放锁
-            break;
-        }
-        DataPacket data(m_datas.front()); //从数据包链表头部取出一个数据
-        m_datas.pop_front();
-
-        m_lock_datas.unlock();
-
-        int tmp_m_write_idx = m_write_idx;
-        //将数据包写入缓冲区
-        if (data.category != IGN)
-        {
-            if (!add_status_line(ReqToString(data.category)) || !add_headers(data.content_len))
-            {
-                //如果数据包类型或头部字段无法全部写入，则取消写入，等待下次发送
-                m_write_idx = tmp_m_write_idx;
-                append_front_data(data);
-                m_threadpool->append(this, 1); //重新扔回线程池队列
-                break;
-            }
-        }
-        tmp_m_write_idx = m_write_idx;
-        if (!add_content(data.content))
-        {
-            //如果数据包正文无法全部写入，则将剩下的数据填入待发送链表头部等待下次发送
-            append_front_data(DataPacket(IGN, data.content_len - (m_write_idx - tmp_m_write_idx), data.content + (m_write_idx - tmp_m_write_idx)));
-            m_threadpool->append(this, 1); //重新扔回线程池队列
-
-            break;
-        }
-        m_bytes_to_send = m_write_idx;
+        LOG_INFO("process_write:EPOLLOUT");
+        Log::get_instance()->flush();
+        modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
     }
+    m_lock_datas.unlock();
 
     m_lock_isProcessWrite.lock();
     m_is_process_write = false;
     m_lock_isProcessWrite.unlock();
-    modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
 }
 
 bool requestProcess::write()
 {
     int temp = 0;
-    if (m_bytes_to_send == 0)
-    {
-        modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-        init_write();
-        return true;
-    }
 
     while (1)
     {
-        temp = send(m_sockfd, m_write_buf, m_write_idx, 0);
+        m_lock_datas.lock();
+        if (m_datas.empty())
+        {
+            m_lock_datas.unlock();
+            break;
+        }
+        auto pack = m_datas.begin();
+        m_lock_datas.unlock();
+
+        temp = send(m_sockfd, pack->m_format_string + pack->byte_have_write, pack->m_format_string_len - pack->byte_have_write, 0);
         if (temp < 0)
         {
-            /*如果TCP写缓冲没有空间，则等待下一轮EPOLLOUT事件，
-            虽然在此期间，服务器无法立即接收到同一客户的下一个请求，
-            但这可以保证链接的完整性*/
+            /*如果TCP写缓冲没有空间，则等待下一轮EPOLLOUT事件，*/
             if (errno == EAGAIN)
             {
                 modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
@@ -709,79 +708,21 @@ bool requestProcess::write()
                 return false;
             }
         }
-        LOG_INFO("send %d bytes data to the client(%s):\n%s", temp, inet_ntoa(m_address.sin_addr), m_write_buf);
+        LOG_INFO("send %d bytes data to the client(%s):\n%s", temp, inet_ntoa(m_address.sin_addr), pack->m_format_string + pack->byte_have_write);
         Log::get_instance()->flush();
-        m_bytes_to_send -= temp;
-        m_bytes_have_send += temp;
+        pack->byte_have_write += temp;
 
-        if (m_bytes_to_send <= 0)
+        if (pack->m_format_string_len - pack->byte_have_write <= 0)
         {
-
             //发送数据包成功
             m_lock_datas.lock();
-            if (m_datas.empty())
-            {
-                modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-            }
-            else
-            {
-                modfd(m_epollfd, m_sockfd, EPOLLOUT, m_connfd_Trig_mode);
-            }
+            m_datas.erase(pack);
             m_lock_datas.unlock();
-            //长连接
-            // modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-            init_write();
-            return true;
         }
     }
-}
-
-bool requestProcess::add_response(const char *format, ...)
-{
-    if (m_write_idx >= WRITE_BUFFER_SIZE)
-    {
-        return false;
-    }
-    va_list arg_list;
-    va_start(arg_list, format);
-    int len = vsnprintf(m_write_buf + m_write_idx,
-                        WRITE_BUFFER_SIZE - 1 - m_write_idx, format, arg_list);
-    if (len >= (WRITE_BUFFER_SIZE - 1 - m_write_idx))
-    {
-        va_end(arg_list);
-        return false;
-    }
-
-    m_write_idx += len;
-    va_end(arg_list);
+    modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
+    init_write();
     return true;
-}
-
-bool requestProcess::add_content(const char *content)
-{
-    return add_response("%s", content);
-}
-
-bool requestProcess::add_status_line(const char *status)
-{
-    return add_response("%s\r\n", status);
-}
-
-bool requestProcess::add_headers(int content_length)
-{
-    if (!add_content_length(content_length))
-        return false;
-    return add_blank_line();
-}
-
-bool requestProcess::add_content_length(int content_length)
-{
-    return add_response("Content-Length: %d\r\n", content_length);
-}
-
-bool requestProcess::add_blank_line()
-{
-    return add_response("%s", "\r\n");
 }
 
 sockaddr_in *requestProcess::get_address()
@@ -789,14 +730,14 @@ sockaddr_in *requestProcess::get_address()
     return &m_address;
 }
 
-void requestProcess::append_front_data(const DataPacket &data)
+void requestProcess::append_front_data(const W_DataPacket &data)
 {
     m_lock_datas.lock();
     m_datas.emplace_front(data);
     m_lock_datas.unlock();
 }
 
-void requestProcess::append_back_data(const DataPacket &data)
+void requestProcess::append_back_data(const W_DataPacket &data)
 {
     m_lock_datas.lock();
     m_datas.emplace_back(data);
@@ -806,7 +747,7 @@ void requestProcess::append_back_data(const DataPacket &data)
 void requestProcess::heartbeat()
 {
     //返回心跳包原文
-    append_back_data(DataPacket(HBT, m_content_length, m_content));
+    append_back_data(W_DataPacket(HBT, m_content_length, m_content));
     m_threadpool->append(this, 1);
 }
 
@@ -820,7 +761,7 @@ void requestProcess::login()
     //如果超出36个字符，说明不合法
     if (l > 36)
     {
-        append_back_data(DataPacket(LGN, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(LGN, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -875,7 +816,7 @@ void requestProcess::login()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(LGN, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(LGN, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -886,12 +827,12 @@ void requestProcess::login()
 
     if (it == user_mp.end() || it->second != password) //用户名或密码错误
     {
-        append_back_data(DataPacket(LGN, 3, "0\r\n"));
+        append_back_data(W_DataPacket(LGN, 3, "0\r\n"));
         m_threadpool->append(this, 1);
     }
     else if (userfd_mp.find(tar_user) != userfd_mp.end()) //用户在线
     {
-        append_back_data(DataPacket(LGN, 4, "-1\r\n"));
+        append_back_data(W_DataPacket(LGN, 4, "-1\r\n"));
         m_threadpool->append(this, 1);
     }
     else
@@ -912,7 +853,7 @@ void requestProcess::login()
 
         userfd_mp[tar_user] = m_sockfd;
 
-        append_back_data(DataPacket(LGN, m_sessionID.length() + 2, (m_sessionID + "\r\n").c_str()));
+        append_back_data(W_DataPacket(LGN, m_sessionID.length() + 2, (m_sessionID + "\r\n").c_str()));
         m_threadpool->append(this, 1);
     }
 
@@ -930,7 +871,7 @@ void requestProcess::regis()
     //如果超出36个字符，说明不合法
     if (l > 36)
     {
-        append_back_data(DataPacket(RGT, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(RGT, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -985,7 +926,7 @@ void requestProcess::regis()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(RGT, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(RGT, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -996,7 +937,7 @@ void requestProcess::regis()
 
     if (it != user_mp.end()) //用户名被占用
     {
-        append_back_data(DataPacket(RGT, 3, "0\r\n"));
+        append_back_data(W_DataPacket(RGT, 3, "0\r\n"));
         m_threadpool->append(this, 1);
     }
     else
@@ -1012,7 +953,7 @@ void requestProcess::regis()
 
         user_mp.insert(pair<string, string>(tar_user, password));
 
-        append_back_data(DataPacket(RGT, 3, "1\r\n"));
+        append_back_data(W_DataPacket(RGT, 3, "1\r\n"));
         m_threadpool->append(this, 1);
 
         LOG_INFO("register a user :%s", tar_user.c_str());
@@ -1057,7 +998,7 @@ void requestProcess::search_user()
 {
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(SCU, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(SCU, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1067,7 +1008,7 @@ void requestProcess::search_user()
     //如果超出18个字符，说明不合法
     if (l > 18)
     {
-        append_back_data(DataPacket(SCU, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(SCU, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1102,7 +1043,7 @@ void requestProcess::search_user()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(SCU, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(SCU, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1113,12 +1054,28 @@ void requestProcess::search_user()
 
     if (it != user_mp.end()) //用户名存在
     {
-        append_back_data(DataPacket(SCU, 3, "1\r\n"));
+        append_back_data(W_DataPacket(SCU, 3, "1\r\n"));
+        string f_path = "datas/avatar/" + tar_user + ".png";
+        // 这是一个存储文件(夹)信息的结构体，其中有文件大小和创建时间、访问时间、修改时间等
+        struct stat statbuf;
+        // 提供文件名字符串，获得文件属性结构体
+        stat(f_path.c_str(), &statbuf);
+        int f_size = statbuf.st_size;
+        fstream fs(f_path, ios::in | ios::binary);
+        char *content = new char[tar_user.length() + 2 + f_size];
+        memcpy(content, (tar_user + "\r\n").c_str(), tar_user.length() + 2);
+        if (fs.is_open())
+        {
+            fs.read(content + tar_user.length() + 2, f_size);
+            append_back_data(W_DataPacket(RAV, tar_user.length() + 2 + f_size, content));
+        }
+        fs.close();
+        delete[] content;
         m_threadpool->append(this, 1);
     }
     else //用户名不存在
     {
-        append_back_data(DataPacket(SCU, 3, "0\r\n"));
+        append_back_data(W_DataPacket(SCU, 3, "0\r\n"));
         m_threadpool->append(this, 1);
     }
 
@@ -1131,7 +1088,7 @@ void requestProcess::add_friend()
 
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(ADF, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(ADF, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1141,7 +1098,7 @@ void requestProcess::add_friend()
     //如果超出18个字符，说明不合法
     if (l > 18)
     {
-        append_back_data(DataPacket(ADF, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(ADF, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1176,7 +1133,7 @@ void requestProcess::add_friend()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(ADF, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(ADF, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1188,7 +1145,7 @@ void requestProcess::add_friend()
 
     if (tar_user == m_username) //不能添加自己为好友
     {
-        append_back_data(DataPacket(ADF, 4, "-3\r\n"));
+        append_back_data(W_DataPacket(ADF, 4, "-3\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1205,14 +1162,30 @@ void requestProcess::add_friend()
                 if (frireq_mp[m_username].count(tar_user) == 0) //目标用户没有向本用户发送申请
                 {
                     frireq_mp[tar_user].insert(m_username);
-                    append_back_data(DataPacket(ADF, 3, "1\r\n"));
+                    append_back_data(W_DataPacket(ADF, 3, "1\r\n"));
                     m_threadpool->append(this, 1);
 
                     auto it_tar_user = userfd_mp.find(tar_user);
 
                     if (it_tar_user != userfd_mp.end()) //用户在线
                     {
-                        m_users[it_tar_user->second].append_back_data(DataPacket(RFR, m_username.length() + 2, (m_username + "\r\n").c_str()));
+                        m_users[it_tar_user->second].append_back_data(W_DataPacket(RFR, m_username.length() + 2, (m_username + "\r\n").c_str()));
+                        string f_path = "datas/avatar/" + m_username + ".png";
+                        // 这是一个存储文件(夹)信息的结构体，其中有文件大小和创建时间、访问时间、修改时间等
+                        struct stat statbuf;
+                        // 提供文件名字符串，获得文件属性结构体
+                        stat(f_path.c_str(), &statbuf);
+                        int f_size = statbuf.st_size;
+                        fstream fs(f_path, ios::in | ios::binary);
+                        char *content = new char[m_username.length() + 2 + f_size];
+                        memcpy(content, (m_username + "\r\n").c_str(), m_username.length() + 2);
+                        if (fs.is_open())
+                        {
+                            fs.read(content + m_username.length() + 2, f_size);
+                            m_users[it_tar_user->second].append_back_data(W_DataPacket(RAV, m_username.length() + 2 + f_size, content));
+                        }
+                        fs.close();
+                        delete[] content;
                         m_threadpool->append(m_users + it_tar_user->second, 1);
                     }
                     else
@@ -1224,29 +1197,34 @@ void requestProcess::add_friend()
                         LOG_INFO("do mysql query:%s", sql_insert.c_str());
                         Log::get_instance()->flush();
                         int res = mysql_query(mysql, sql_insert.c_str());
+
+                        sql_insert = "INSERT INTO data_not_send_tb(user_name, category,content_len, content) VALUES('" + tar_user + "', '" + to_string(RAV) + "', '" + to_string(m_username.length()) + "', '" + (m_username) + "')";
+                        LOG_INFO("do mysql query:%s", sql_insert.c_str());
+                        Log::get_instance()->flush();
+                        res = mysql_query(mysql, sql_insert.c_str());
                     }
                 }
                 else //目标用户已经向本用户发送了好友请求
                 {
-                    append_back_data(DataPacket(ADF, 3, "3\r\n"));
+                    append_back_data(W_DataPacket(ADF, 3, "3\r\n"));
                     m_threadpool->append(this, 1);
                 }
             }
             else //已经发过好友申请
             {
-                append_back_data(DataPacket(ADF, 4, "-1\r\n"));
+                append_back_data(W_DataPacket(ADF, 4, "-1\r\n"));
                 m_threadpool->append(this, 1);
             }
         }
         else //两人已经是好友
         {
-            append_back_data(DataPacket(ADF, 3, "2\r\n"));
+            append_back_data(W_DataPacket(ADF, 3, "2\r\n"));
             m_threadpool->append(this, 1);
         }
     }
     else //用户名不存在
     {
-        append_back_data(DataPacket(ADF, 3, "0\r\n"));
+        append_back_data(W_DataPacket(ADF, 3, "0\r\n"));
         m_threadpool->append(this, 1);
     }
 
@@ -1258,7 +1236,7 @@ void requestProcess::reply_friend_request()
 {
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(RFR, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(RFR, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1343,15 +1321,15 @@ void requestProcess::reply_friend_request()
                 friend_mp[m_username].insert(tar_user);
                 friend_mp[tar_user].insert(m_username);
 
-                append_back_data(DataPacket(AFI, tar_user.length() + 2, (tar_user + "\r\n").c_str()));
+                append_back_data(W_DataPacket(AFI, tar_user.length() + 2, (tar_user + "\r\n").c_str()));
                 string s_time = to_string(timestamp());
-                append_back_data(DataPacket(RMA, tar_user.length() + 2 + s_time.length() + 2 + 47, (tar_user + "\r\n" + s_time + "\r\n" + "我们已经是好友了，快开始聊天吧\r\n").c_str()));
+                append_back_data(W_DataPacket(RMA, tar_user.length() + 2 + s_time.length() + 2 + 47, (tar_user + "\r\n" + s_time + "\r\n" + "我们已经是好友了，快开始聊天吧\r\n").c_str()));
                 m_threadpool->append(this, 1);
 
                 if (userfd_mp.find(tar_user) != userfd_mp.end()) //用户在线
                 {
-                    m_users[userfd_mp[tar_user]].append_back_data(DataPacket(AFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
-                    m_users[userfd_mp[tar_user]].append_back_data(DataPacket(RMA, m_username.length() + 2 + s_time.length() + 2 + 47, (m_username + "\r\n" + s_time + "\r\n" + "我们已经是好友了，快开始聊天吧\r\n").c_str()));
+                    m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(AFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
+                    m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(RMA, m_username.length() + 2 + s_time.length() + 2 + 47, (m_username + "\r\n" + s_time + "\r\n" + "我们已经是好友了，快开始聊天吧\r\n").c_str()));
                     m_threadpool->append(m_users + userfd_mp[tar_user], 1);
                 }
                 else
@@ -1395,7 +1373,7 @@ void requestProcess::reconnect()
     //如果超出20个字符，说明不合法
     if (l > 20)
     {
-        append_back_data(DataPacket(RCN, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(RCN, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1431,7 +1409,7 @@ void requestProcess::reconnect()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(RCN, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(RCN, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1446,12 +1424,12 @@ void requestProcess::reconnect()
         userfd_mp[sessionID_mp[sessionID]] = m_sockfd;
         m_sessionID = sessionID;
 
-        append_back_data(DataPacket(RCN, 3, "1\r\n"));
+        append_back_data(W_DataPacket(RCN, 3, "1\r\n"));
         m_threadpool->append(this, 1);
     }
     else //不存在sessionID
     {
-        append_back_data(DataPacket(RCN, 3, "0\r\n"));
+        append_back_data(W_DataPacket(RCN, 3, "0\r\n"));
         m_threadpool->append(this, 1);
     }
 
@@ -1467,7 +1445,7 @@ void requestProcess::get_friend_items()
 {
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(GFI, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(GFI, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1482,7 +1460,7 @@ void requestProcess::get_friend_items()
         content += fri + "\r\n";
     }
 
-    append_back_data(DataPacket(GFI, content.length(), content.c_str()));
+    append_back_data(W_DataPacket(GFI, content.length(), content.c_str()));
     m_threadpool->append(this, 1);
 
     lock.unlock();
@@ -1495,7 +1473,7 @@ void requestProcess::delete_friend()
 {
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(DEF, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(DEF, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1507,7 +1485,7 @@ void requestProcess::delete_friend()
     //如果超出18个字符，说明不合法
     if (l > 18)
     {
-        append_back_data(DataPacket(RCN, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(RCN, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1542,7 +1520,7 @@ void requestProcess::delete_friend()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(DEF, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(DEF, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1565,12 +1543,12 @@ void requestProcess::delete_friend()
         friend_mp[m_username].erase(tar_user);
         friend_mp[tar_user].erase(m_username);
 
-        append_back_data(DataPacket(DFI, tar_user.length() + 2, (tar_user + "\r\n").c_str()));
+        append_back_data(W_DataPacket(DFI, tar_user.length() + 2, (tar_user + "\r\n").c_str()));
         m_threadpool->append(this, 1);
 
         if (userfd_mp.find(tar_user) != userfd_mp.end()) //用户在线
         {
-            m_users[userfd_mp[tar_user]].append_back_data(DataPacket(DFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
+            m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(DFI, m_username.length() + 2, (m_username + "\r\n").c_str()));
             m_threadpool->append(m_users + userfd_mp[tar_user], 1);
         }
         else
@@ -1598,7 +1576,7 @@ void requestProcess::send_message()
 
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(SMA, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(SMA, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1653,7 +1631,7 @@ void requestProcess::send_message()
     }
     if (!isNice)
     {
-        append_back_data(DataPacket(SMA, 4, "-2\r\n"));
+        append_back_data(W_DataPacket(SMA, 4, "-2\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1665,7 +1643,7 @@ void requestProcess::send_message()
 
     if (tar_user == m_username) //不能发送给自己
     {
-        append_back_data(DataPacket(SMA, 4, "-3\r\n"));
+        append_back_data(W_DataPacket(SMA, 4, "-3\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1678,14 +1656,14 @@ void requestProcess::send_message()
         if (friend_mp[tar_user].count(m_username) == 1) //两人是好友关系
         {
             string s_time = to_string(timestamp());
-            append_back_data(DataPacket(SMA, msg_id.length() + 2 + s_time.length() + 2, (msg_id + "\r\n" + s_time + "\r\n").c_str()));
+            append_back_data(W_DataPacket(SMA, msg_id.length() + 2 + s_time.length() + 2, (msg_id + "\r\n" + s_time + "\r\n").c_str()));
             m_threadpool->append(this, 1);
 
             auto it_tar_user = userfd_mp.find(tar_user);
 
             if (it_tar_user != userfd_mp.end()) //用户在线
             {
-                m_users[it_tar_user->second].append_back_data(DataPacket(RMA, m_username.length() + 2 + s_time.length() + 2 + content.length() + 2, (m_username + "\r\n" + s_time + "\r\n" + content + "\r\n").c_str()));
+                m_users[it_tar_user->second].append_back_data(W_DataPacket(RMA, m_username.length() + 2 + s_time.length() + 2 + content.length() + 2, (m_username + "\r\n" + s_time + "\r\n" + content + "\r\n").c_str()));
                 m_threadpool->append(m_users + it_tar_user->second, 1);
             }
             else
@@ -1717,13 +1695,13 @@ void requestProcess::send_message()
         }
         else //两人不是好友
         {
-            append_back_data(DataPacket(SMA, 3, "0\r\n"));
+            append_back_data(W_DataPacket(SMA, 3, "0\r\n"));
             m_threadpool->append(this, 1);
         }
     }
     else //用户名不存在
     {
-        append_back_data(DataPacket(SMA, 4, "-1\r\n"));
+        append_back_data(W_DataPacket(SMA, 4, "-1\r\n"));
         m_threadpool->append(this, 1);
     }
 
@@ -1736,7 +1714,7 @@ void requestProcess::client_ready()
 
     if (m_sessionID == "") //没有权限
     {
-        append_back_data(DataPacket(RDY, 4, "-4\r\n"));
+        append_back_data(W_DataPacket(RDY, 4, "-4\r\n"));
         m_threadpool->append(this, 1);
         return;
     }
@@ -1768,13 +1746,35 @@ void requestProcess::client_ready()
     auto fields = mysql_fetch_fields(result);
 
     lock.lock();
-    //从结果集中获取下一行，将对应的用户名和密码，存入map中
+    //从结果集中获取下一行
     while (MYSQL_ROW row = mysql_fetch_row(result))
     {
         string temp1(row[0]);
         string temp2(row[1]);
         string temp3(row[2]);
-        append_back_data(DataPacket(PACKET_TYPE(stoi(temp1)), stoi(temp2), temp3.c_str()));
+        if (PACKET_TYPE(stoi(temp1)) == RAV)
+        {
+            string f_path = "datas/avatar/" + temp3 + ".png";
+            // 这是一个存储文件(夹)信息的结构体，其中有文件大小和创建时间、访问时间、修改时间等
+            struct stat statbuf;
+            // 提供文件名字符串，获得文件属性结构体
+            stat(f_path.c_str(), &statbuf);
+            int f_size = statbuf.st_size;
+            fstream fs(f_path, ios::in | ios::binary);
+            char *content = new char[temp3.length() + 2 + f_size];
+            memcpy(content, (temp3 + "\r\n").c_str(), temp3.length() + 2);
+            if (fs.is_open())
+            {
+                fs.read(content + temp3.length() + 2, f_size);
+                append_back_data(W_DataPacket(PACKET_TYPE(stoi(temp1)), temp3.length() + 2 + f_size, content));
+            }
+            fs.close();
+            delete[] content;
+        }
+        else
+        {
+            append_back_data(W_DataPacket(PACKET_TYPE(stoi(temp1)), stoi(temp2), temp3.c_str()));
+        }
     }
 
     m_threadpool->append(this, 1);
@@ -1788,6 +1788,61 @@ void requestProcess::client_ready()
     if (mysql_query(mysql, sql_delete.c_str()))
     {
         LOG_ERROR("DELETE error:%s\n", mysql_error(mysql));
+    }
+}
+
+//处理更换头像逻辑
+void requestProcess::change_avatar()
+{
+
+    if (m_sessionID == "") //没有权限
+    {
+        append_back_data(W_DataPacket(SAV, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    ofstream outFile;
+    outFile.open("datas/avatar/" + m_username + ".png");
+
+    for (int i = 0; i < m_content_length; ++i)
+    {
+        outFile << m_content[i];
+    }
+    outFile.close();
+
+    append_back_data(W_DataPacket(SAV, 4, "1\r\n"));
+    m_threadpool->append(this, 1);
+
+    int send_content_len = m_username.length() + 2 + m_content_length;
+    char *send_content = new char[send_content_len];
+    memcpy(send_content, (m_username + "\r\n").c_str(), m_username.length() + 2);
+    memcpy(send_content + m_username.length() + 2, m_content, m_content_length);
+
+    W_DataPacket pack(RAV, send_content_len, send_content);
+
+    for (const auto &tar_user : friend_mp[m_username])
+    {
+        auto it_tar_user = userfd_mp.find(tar_user);
+
+        if (it_tar_user != userfd_mp.end()) //用户在线
+        {
+            m_users[it_tar_user->second].append_back_data(pack);
+            m_threadpool->append(m_users + it_tar_user->second, 1);
+        }
+        else
+        {
+            string sql_insert = "INSERT INTO data_not_send_tb(user_name, category,content_len, content) VALUES('" + tar_user + "', '" + to_string(RAV) + "', '" + to_string(m_username.length()) + "', '" + (m_username) + "')";
+            //从连接池中取一个连接
+            MYSQL *mysql;
+            connectionRAII mysqlcon(&mysql, m_connPool);
+            LOG_INFO("do mysql query:%s", sql_insert.c_str());
+            Log::get_instance()->flush();
+            mysql_query(mysql, "set names utf8");
+            int res = mysql_query(mysql, sql_insert.c_str());
+        }
     }
 }
 
@@ -1825,6 +1880,10 @@ const char *requestProcess::ReqToString(requestProcess::PACKET_TYPE r)
         return "RMA";
     case RDY:
         return "RDY";
+    case SAV:
+        return "SAV";
+    case RAV:
+        return "RAV";
     default:
         return "ERR";
     }

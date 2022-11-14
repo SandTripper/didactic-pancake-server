@@ -25,15 +25,13 @@
 #include "../threadpool/threadpool.h"
 #include "../log/log.h"
 
-class DataPacket;
+class W_DataPacket;
 
 class requestProcess
 {
 public:
     //读缓冲区的大小
     static const int READ_BUFFER_SIZE = 1024;
-    //写缓冲区的大小
-    static const int WRITE_BUFFER_SIZE = 1024;
 
     /*数据包类型
      HBT表示发送心跳包；
@@ -51,7 +49,9 @@ public:
      SMA表示发送消息；
      RMA表示接收消息；
      RDY表示客户端就绪；
-     IGN：服务器独有，用于表示发送到一半的数据包
+     IGN为服务器独有，用于表示发送到一半的数据包
+     SAV表示发送头像数据
+     RAV表示接收头像数据
      */
     enum PACKET_TYPE
     {
@@ -70,7 +70,9 @@ public:
         SMA,
         RMA,
         RDY,
-        IGN
+        IGN,
+        SAV,
+        RAV
     };
 
     /*主状态机的三种可能状态
@@ -138,10 +140,13 @@ public:
     void initmysql_result(connectionPool *connPool);
 
     //往待发送链表头部添加数据包
-    void append_front_data(const DataPacket &data);
+    void append_front_data(const W_DataPacket &data);
 
     //往待发送链表尾部添加数据包
-    void append_back_data(const DataPacket &data);
+    void append_back_data(const W_DataPacket &data);
+
+    // REQUEST转const char*
+    static const char *ReqToString(PACKET_TYPE r);
 
 private:
     //初始化连接
@@ -166,14 +171,6 @@ private:
     RESULT_CODE do_request();
     char *get_line();
     LINE_STATUS parse_line();
-
-    //下面这一组函数被process_write调用以生成数据包
-    bool add_response(const char *format, ...);
-    bool add_content(const char *content);
-    bool add_status_line(const char *status);
-    bool add_headers(int content_length);
-    bool add_content_length(int content_length);
-    bool add_blank_line();
 
     //下面这一组为客户请求逻辑处理函数
     //处理心跳包逻辑
@@ -200,9 +197,8 @@ private:
     void send_message();
     //处理客户端就绪逻辑
     void client_ready();
-
-    // REQUEST转const char*
-    const char *ReqToString(PACKET_TYPE r);
+    //处理更换头像逻辑
+    void change_avatar();
 
     //获取毫秒级别时间戳
     long long timestamp();
@@ -241,12 +237,6 @@ private:
     //当前正在解析的行的起始位置
     int m_start_line;
 
-    //写缓冲区
-    char m_write_buf[WRITE_BUFFER_SIZE];
-
-    //写缓冲区中待发送的字节数
-    int m_write_idx;
-
     //主状态机当前所处的状态
     CHECK_STATE m_check_state;
 
@@ -265,11 +255,6 @@ private:
     //存储数据包正文
     char *m_content;
 
-    //需要发送的字节数
-    int m_bytes_to_send;
-    //已经发送的字节数
-    int m_bytes_have_send;
-
     // listenfd是否开启ET模式，ET模式为1，LT模式为0
     int m_listenfd_Trig_mode;
 
@@ -282,51 +267,81 @@ private:
 
     //待发送的数据包,配一把互斥锁
     mutexLocker m_lock_datas;
-    list<DataPacket> m_datas;
+    list<W_DataPacket> m_datas;
 };
 
-//数据包类
-class DataPacket
+//写数据包类
+class W_DataPacket
 {
 public:
-    DataPacket()
+    W_DataPacket()
     {
-        category = requestProcess::HBT;
-        content_len = 0;
-        content = NULL;
+        m_category = requestProcess::HBT;
+        m_content_len = 0;
+        m_content = nullptr;
+        m_format_string_len = 0;
+        m_format_string = nullptr;
+        byte_have_write = 0;
     }
     //传入的字符串以'\0'标识结尾
-    DataPacket(requestProcess::PACKET_TYPE cat, const char *con)
+    W_DataPacket(requestProcess::PACKET_TYPE cat, const char *con)
     {
-        category = cat;
-        content_len = strlen(con);
-        content = new char[content_len + 1];
-        strncpy(content, con, content_len);
-        content[content_len] = '\0';
+        m_category = cat;
+        m_content_len = strlen(con);
+        byte_have_write = 0;
+        make_format(con);
     }
-    DataPacket(requestProcess::PACKET_TYPE cat, int conlen, const char *con)
+    W_DataPacket(requestProcess::PACKET_TYPE cat, int conlen, const char *con)
     {
-        category = cat;
-        content_len = conlen;
-        content = new char[conlen + 1];
-        strncpy(content, con, conlen);
-        content[content_len] = '\0';
+        m_category = cat;
+        m_content_len = conlen;
+        byte_have_write = 0;
+        make_format(con);
     }
-    DataPacket(const DataPacket &other)
+    W_DataPacket(const W_DataPacket &other)
     {
-        category = other.category;
-        content_len = other.content_len;
-        content = new char[content_len + 1];
-        strncpy(content, other.content, content_len);
-        content[content_len] = '\0';
+        m_category = other.m_category;
+        m_content_len = other.m_content_len;
+        m_format_string_len = other.m_format_string_len;
+        m_format_string = new char[m_format_string_len + 1];
+        memcpy(m_format_string, other.m_format_string, m_format_string_len);
+        m_format_string[m_format_string_len] = '\0';
+        byte_have_write = other.byte_have_write;
     }
-    ~DataPacket()
+    ~W_DataPacket()
     {
-        delete[] content;
+        if (m_format_string != nullptr)
+        {
+            delete[] m_format_string;
+        }
     }
-    requestProcess::PACKET_TYPE category;
-    int content_len;
-    char *content;
+
+private:
+    void make_format(const char *content)
+    {
+        string type_head_str = requestProcess::ReqToString(m_category);
+        type_head_str += "\r\nContent-Length: ";
+        type_head_str += std::to_string(m_content_len);
+        type_head_str += "\r\n\r\n";
+        int type_head_str_len = type_head_str.length();
+
+        m_format_string_len = type_head_str_len + m_content_len;
+        m_format_string = new char[m_format_string_len + 1];
+
+        memcpy(m_format_string, type_head_str.c_str(), type_head_str_len);
+        memcpy(m_format_string + type_head_str_len, content, m_content_len);
+
+        m_format_string[m_format_string_len] = '\0';
+        m_content = m_format_string + type_head_str_len;
+    }
+
+public:
+    requestProcess::PACKET_TYPE m_category;
+    int m_content_len;
+    char *m_content;
+    int m_format_string_len;
+    char *m_format_string;
+    int byte_have_write;
 };
 
 #endif // REQUEST_PROCESS_H

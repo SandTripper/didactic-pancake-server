@@ -15,8 +15,9 @@ extern int addfd(int epollfd, int fd, bool oneshot, int triggermode);
 extern int removefd(int epollfd, int fd);
 extern int setnonblocking(int fd);
 
+int pipefd[2];
+
 //设置定时器相关参数
-static int pipefd[2];
 static time_wheel time_whl;
 static int epollfd = 0;
 
@@ -88,11 +89,11 @@ int main(int argc, char *argv[])
 
     if (logmode)
     {
-        Log::get_instance()->init("./logs/ServerLog", 2000, 800000, 8); //异步日志模型
+        Log::get_instance()->init("./logs/ServerLog.log", 2000, 800000, 8); //异步日志模型
     }
     else
     {
-        Log::get_instance()->init("./logs/ServerLog", 2000, 800000, 0); //同步日志模型
+        Log::get_instance()->init("./logs/ServerLog.log", 2000, 800000, 0); //同步日志模型
     }
 
     LOG_INFO("ip address:%s", ipAddress.c_str());
@@ -312,6 +313,44 @@ int main(int argc, char *argv[])
                         {
                             stop_server = true;
                         }
+                            // case MY_SIGREAD:
+                            // {
+                            //     int read_sockfd = 0;
+                            //     for (int j = 4; j >= 1; --j)
+                            //     {
+                            //         read_sockfd *= 256;
+                            //         read_sockfd += signals[i + j] + 128;
+                            //     }
+                            //     printf("MY_SIGREAD soc = %d\n", read_sockfd);
+                            //     tw_timer *timer = users_timer[read_sockfd].timer;
+                            //     //根据读的结果，决定是将任务添加到线程池，还是要关闭连接
+                            //     if (users[read_sockfd].read())
+                            //     {
+                            //         LOG_INFO("deal with the client(%s)", inet_ntoa(users[read_sockfd].get_address()->sin_addr));
+                            //         Log::get_instance()->flush();
+                            //         pool->append(users + read_sockfd, 0);
+
+                            //         //有数据传输，将定时器往后延迟
+                            //         if (timer)
+                            //         {
+                            //             time_t cur = time(NULL);
+                            //             time_whl.del_timer(timer);
+                            //             timer = time_whl.add_timer(TIMELIMIT);
+                            //             users_timer[read_sockfd].timer = timer;
+                            //             timer->cb_func = cb_func;
+                            //             timer->user_data = &users_timer[read_sockfd];
+                            //         }
+                            //     }
+                            //     else //关闭连接
+                            //     {
+                            //         timer->cb_func(&users_timer[read_sockfd]);
+                            //         if (timer)
+                            //         {
+                            //             time_whl.del_timer(timer);
+                            //         }
+                            //     }
+                            //     i += 4;
+                            // }
                         }
                     }
                 }
