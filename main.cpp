@@ -70,7 +70,8 @@ int main(int argc, char *argv[])
     srand(time(0));
 
     std::string ipAddress;
-    int port;
+    int tcp_port;
+    int udp_port;
     int logmode = 0;
     int connfd_Trig_mode;
     int listenfd_Trig_mode;
@@ -79,7 +80,8 @@ int main(int argc, char *argv[])
     const char ConfigFile[] = "server.config";
     Config configSettings(ConfigFile);
 
-    port = configSettings.Read("port", 0);
+    tcp_port = configSettings.Read("tcp_port", 0);
+    udp_port = configSettings.Read("udp_port", 0);
     ipAddress = configSettings.Read("localhost", ipAddress);
 
     connfd_Trig_mode = configSettings.Read("connection_mode", 0);
@@ -97,7 +99,8 @@ int main(int argc, char *argv[])
     }
 
     LOG_INFO("ip address:%s", ipAddress.c_str());
-    LOG_INFO("port :%d", port);
+    LOG_INFO("tcp port :%d", tcp_port);
+    LOG_INFO("udp port :%d", udp_port);
     Log::get_instance()->flush();
 
     if (listenfd_Trig_mode)
@@ -162,12 +165,22 @@ int main(int argc, char *argv[])
     int listenfd = socket(PF_INET, SOCK_STREAM, 0);
     assert(listenfd >= 0);
 
+    int udpSocket = socket(PF_INET, SOCK_DGRAM, 0);
+    assert(udpSocket >= 0);
+
     int ret = 0;
     struct sockaddr_in address;
     bzero(&address, sizeof(address));
     address.sin_family = AF_INET;
     inet_pton(AF_INET, ipAddress.c_str(), &address.sin_addr);
-    address.sin_port = htons(port);
+    address.sin_port = htons(tcp_port);
+
+    // udp
+    struct sockaddr_in udp_address;
+    bzero(&udp_address, sizeof(udp_address));
+    udp_address.sin_family = AF_INET;
+    inet_pton(AF_INET, ipAddress.c_str(), &udp_address.sin_addr);
+    udp_address.sin_port = htons(udp_port);
 
     //设置端口重用
     int flag = 1;
@@ -175,6 +188,9 @@ int main(int argc, char *argv[])
 
     ret = bind(listenfd, (struct sockaddr *)&address, sizeof(address));
     assert(ret >= 0);
+
+    ret = bind(udpSocket, (struct sockaddr *)&udp_address, sizeof(udp_address));
+    assert(ret != -1);
 
     ret = listen(listenfd, 5);
     assert(ret >= 0);
@@ -186,6 +202,8 @@ int main(int argc, char *argv[])
 
     addfd(epollfd, listenfd, false, listenfd_Trig_mode);
     requestProcess::m_epollfd = epollfd;
+
+    addfd(epollfd, udpSocket, false, 0);
 
     //创建信号处理函数用以通知主循环的管道
     ret = socketpair(PF_UNIX, SOCK_STREAM, 0, pipefd);
@@ -313,47 +331,13 @@ int main(int argc, char *argv[])
                         {
                             stop_server = true;
                         }
-                            // case MY_SIGREAD:
-                            // {
-                            //     int read_sockfd = 0;
-                            //     for (int j = 4; j >= 1; --j)
-                            //     {
-                            //         read_sockfd *= 256;
-                            //         read_sockfd += signals[i + j] + 128;
-                            //     }
-                            //     printf("MY_SIGREAD soc = %d\n", read_sockfd);
-                            //     tw_timer *timer = users_timer[read_sockfd].timer;
-                            //     //根据读的结果，决定是将任务添加到线程池，还是要关闭连接
-                            //     if (users[read_sockfd].read())
-                            //     {
-                            //         LOG_INFO("deal with the client(%s)", inet_ntoa(users[read_sockfd].get_address()->sin_addr));
-                            //         Log::get_instance()->flush();
-                            //         pool->append(users + read_sockfd, 0);
-
-                            //         //有数据传输，将定时器往后延迟
-                            //         if (timer)
-                            //         {
-                            //             time_t cur = time(NULL);
-                            //             time_whl.del_timer(timer);
-                            //             timer = time_whl.add_timer(TIMELIMIT);
-                            //             users_timer[read_sockfd].timer = timer;
-                            //             timer->cb_func = cb_func;
-                            //             timer->user_data = &users_timer[read_sockfd];
-                            //         }
-                            //     }
-                            //     else //关闭连接
-                            //     {
-                            //         timer->cb_func(&users_timer[read_sockfd]);
-                            //         if (timer)
-                            //         {
-                            //             time_whl.del_timer(timer);
-                            //         }
-                            //     }
-                            //     i += 4;
-                            // }
                         }
                     }
                 }
+            }
+            else if (sockfd == udpSocket)
+            {
+                requestProcess::handleUdpPack(sockfd);
             }
             //处理客户连接上接收到的数据
             else if (events[i].events & EPOLLIN)
@@ -427,6 +411,7 @@ int main(int argc, char *argv[])
     }
     close(epollfd);
     close(listenfd);
+    close(udpSocket);
     close(pipefd[1]);
     close(pipefd[0]);
     delete[] users;

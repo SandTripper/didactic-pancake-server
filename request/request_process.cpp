@@ -8,10 +8,21 @@
 
 using namespace std;
 
+#define UDP_BUFFER_SIZE 1200
+
 int requestProcess::m_user_count = 0;
 int requestProcess::m_epollfd = -1;
 
 extern int pipefd[2];
+
+char udpReadBuf[UDP_BUFFER_SIZE];
+
+struct voice
+{
+    int chat_id;
+    int lens;
+    char audiodata[960];
+} vp;
 
 //初始化静态变量
 threadpool *requestProcess::m_threadpool = NULL;
@@ -24,14 +35,30 @@ map<string, string> user_mp;
  <sessionID,tar_user>*/
 map<string, string> sessionID_mp;
 /*储存用户名对应的描述符
- <tar_user,connfd>*/
+<user,connfd>*/
 map<string, int> userfd_mp;
 /*储存好友申请
-<tar_user,applys>*/
+<user,applys>*/
 map<string, set<string>> frireq_mp;
 /* 储存好友关系
-<tar_user,friends>*/
+<user,friends>*/
 map<string, set<string>> friend_mp;
+
+/* 储存语音聊天对象
+<user,<tar_user,id>>*/
+map<string, string> voice_chat_mp;
+
+/* 储存语音聊天编号对应的用户
+<id,user>*/
+map<int, string> voice_id_to_user_mp;
+
+/* 储存用户对应的语音聊天编号
+<user,id>*/
+map<string, int> user_to_voice_id_mp;
+
+/* 储存语音聊天编号对应的对方ip信息
+<id,sockaddr_in>*/
+map<int, sockaddr_in> voice_id_sockaddr_mp;
 
 mutexLocker lock;       //互斥锁
 readWriteLocker rwlock; //读写锁
@@ -268,18 +295,8 @@ void requestProcess::process(int mode)
         {
             init_read();
         }
-        else
-        {
-            // char buf[5] = {MY_SIGREAD};
-            // int sofd = m_sockfd;
-            // for (int i = 1; i <= 4; i++)
-            // {
-            //     buf[i] = sofd % 256 - 128;
-            //     sofd /= 256;
-            // }
-            // send(pipefd[1], buf, 5, 0);
-            modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
-        }
+
+        modfd(m_epollfd, m_sockfd, EPOLLIN, m_connfd_Trig_mode);
     }
     else
     {
@@ -517,6 +534,26 @@ requestProcess::RESULT_CODE requestProcess::parse_type_line(char *text)
     {
         m_method = RAV;
     }
+    else if (strcasecmp(method, "SOC") == 0)
+    {
+        m_method = SOC;
+    }
+    else if (strcasecmp(method, "ROC") == 0)
+    {
+        m_method = ROC;
+    }
+    else if (strcasecmp(method, "AOC") == 0)
+    {
+        m_method = AOC;
+    }
+    else if (strcasecmp(method, "DOC") == 0)
+    {
+        m_method = DOC;
+    }
+    else if (strcasecmp(method, "EOC") == 0)
+    {
+        m_method = EOC;
+    }
     else
     {
         return BAD_REQUEST;
@@ -647,6 +684,20 @@ requestProcess::RESULT_CODE requestProcess::do_request()
         break;
     case SAV:
         change_avatar();
+        break;
+    case SOC:
+        start_voice_chat();
+        break;
+    case ROC:
+        reply_voice_chat();
+        break;
+    case AOC:
+        break;
+    case DOC:
+        break;
+    case EOC:
+        end_voice_chat();
+        break;
     default:
         break;
     }
@@ -742,6 +793,124 @@ void requestProcess::append_back_data(const W_DataPacket &data)
     m_lock_datas.lock();
     m_datas.emplace_back(data);
     m_lock_datas.unlock();
+}
+
+const char *requestProcess::ReqToString(requestProcess::PACKET_TYPE r)
+{
+    switch (r)
+    {
+    case HBT:
+        return "HBT";
+    case LGN:
+        return "LGN";
+    case RGT:
+        return "RGT";
+    case LGT:
+        return "LGT";
+    case SCU:
+        return "SCU";
+    case ADF:
+        return "ADF";
+    case DEF:
+        return "DEF";
+    case RFR:
+        return "RFR";
+    case RCN:
+        return "RCN";
+    case GFI:
+        return "GFI";
+    case AFI:
+        return "AFI";
+    case DFI:
+        return "DFI";
+    case SMA:
+        return "SMA";
+    case RMA:
+        return "RMA";
+    case RDY:
+        return "RDY";
+    case SAV:
+        return "SAV";
+    case RAV:
+        return "RAV";
+    case SOC:
+        return "SOC";
+    case ROC:
+        return "ROC";
+    case AOC:
+        return "AOC";
+    case DOC:
+        return "DOC";
+    case EOC:
+        return "EOC";
+    default:
+        return "ERR";
+    }
+}
+
+long long requestProcess::timestamp()
+{
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
+
+void requestProcess::handleUdpPack(int udpSocket)
+{
+    struct sockaddr_in client_address;
+    socklen_t client_addrlength;
+
+    memset(udpReadBuf, 0, sizeof(udpReadBuf));
+    int len = recvfrom(udpSocket, udpReadBuf, UDP_BUFFER_SIZE, 0, (struct sockaddr *)&client_address, &client_addrlength);
+    if (len >= 0)
+    {
+        //解析用户名和密码
+
+        LOG_INFO("get udp pack,chat id is %d", vp.chat_id);
+        Log::get_instance()->flush();
+
+        memset(&vp, 0, sizeof(vp));
+
+        memcpy(&vp, udpReadBuf, sizeof(vp));
+
+        if (voice_id_sockaddr_mp.find(vp.chat_id) == voice_id_sockaddr_mp.end())
+        {
+            voice_id_sockaddr_mp[vp.chat_id] = client_address;
+        }
+
+        struct sockaddr_in tar_address;
+        socklen_t tar_addrlength;
+        int isGood = false;
+
+        lock.lock();
+        if (voice_id_to_user_mp.find(vp.chat_id) != voice_id_to_user_mp.end())
+        {
+            string m_username = voice_id_to_user_mp[vp.chat_id];
+            if (voice_chat_mp.find(m_username) != voice_chat_mp.end())
+            {
+                string tar_user = voice_chat_mp[m_username];
+                if (user_to_voice_id_mp.find(tar_user) != user_to_voice_id_mp.end())
+                {
+                    int tar_id = user_to_voice_id_mp[tar_user];
+                    if (voice_id_sockaddr_mp.find(tar_id) != voice_id_sockaddr_mp.end())
+                    {
+                        tar_address = voice_id_sockaddr_mp[tar_id];
+                        isGood = true;
+                    }
+                }
+            }
+        }
+        lock.unlock();
+
+        if (isGood)
+        {
+            LOG_INFO("good udp pack,chat id is %d", vp.chat_id);
+            Log::get_instance()->flush();
+            tar_addrlength = sizeof(tar_address);
+            sendto(udpSocket, (const char *)&vp, sizeof(vp), 0, (struct sockaddr *)&tar_address, tar_addrlength);
+        }
+    }
 }
 
 void requestProcess::heartbeat()
@@ -1846,53 +2015,218 @@ void requestProcess::change_avatar()
     }
 }
 
-const char *requestProcess::ReqToString(requestProcess::PACKET_TYPE r)
+//处理发起语音聊天逻辑
+void requestProcess::start_voice_chat()
 {
-    switch (r)
+    if (m_sessionID == "") //没有权限
     {
-    case HBT:
-        return "HBT";
-    case LGN:
-        return "LGN";
-    case RGT:
-        return "RGT";
-    case LGT:
-        return "LGT";
-    case SCU:
-        return "SCU";
-    case ADF:
-        return "ADF";
-    case DEF:
-        return "DEF";
-    case RFR:
-        return "RFR";
-    case RCN:
-        return "RCN";
-    case GFI:
-        return "GFI";
-    case AFI:
-        return "AFI";
-    case DFI:
-        return "DFI";
-    case SMA:
-        return "SMA";
-    case RMA:
-        return "RMA";
-    case RDY:
-        return "RDY";
-    case SAV:
-        return "SAV";
-    case RAV:
-        return "RAV";
-    default:
-        return "ERR";
+        append_back_data(W_DataPacket(SOC, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
     }
+
+    int l = m_content_length;
+
+    //如果超出18个字符，说明不合法
+    if (l > 18)
+    {
+        append_back_data(W_DataPacket(SOC, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    //解析用户名
+    string tar_user = "";
+    for (int i = 0; i < l - 1; i++)
+    {
+        if (m_content[i] == '\r' && m_content[i + 1] == '\n')
+        {
+            break;
+        }
+        tar_user += m_content[i];
+    }
+
+    //判断用户名是否合法
+    bool isNice = true;
+
+    if (tar_user.length() > 16 || tar_user == "")
+    {
+        isNice = false;
+    }
+    else
+    {
+        for (const auto &c : tar_user)
+        {
+            if (!isdigit(c) && !isalpha(c))
+            {
+                isNice = false;
+            }
+        }
+    }
+    if (!isNice)
+    {
+        append_back_data(W_DataPacket(SOC, 4, "-2\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    LOG_INFO("user %s apply to start a voice chat to user %s", m_username.c_str(), tar_user.c_str());
+    Log::get_instance()->flush();
+
+    lock.lock();
+    if (tar_user == m_username || friend_mp[m_username].count(tar_user) == 0) //向自己发起请求或者不是好友关系
+    {
+        append_back_data(W_DataPacket(SOC, 4, "-3\r\n"));
+        m_threadpool->append(this, 1);
+        lock.unlock();
+        return;
+    }
+
+    if (voice_chat_mp.find(m_username) == voice_chat_mp.end() && voice_chat_mp.find(tar_user) == voice_chat_mp.end()) //双方都空闲
+    {
+        auto it_tar_user = userfd_mp.find(tar_user);
+        if (it_tar_user != userfd_mp.end()) //对方在线
+        {
+            voice_chat_mp[m_username] = tar_user;
+            voice_chat_mp[tar_user] = m_username;
+
+            append_back_data(W_DataPacket(SOC, 4, "1\r\n"));
+            m_threadpool->append(this, 1);
+
+            m_users[it_tar_user->second].append_back_data(W_DataPacket(ROC, m_username.length() + 2, (m_username + "\r\n").c_str()));
+            m_threadpool->append(m_users + it_tar_user->second, 1);
+        }
+        else
+        {
+            append_back_data(W_DataPacket(SOC, 4, "-1\r\n"));
+            m_threadpool->append(this, 1);
+        }
+    }
+    else //双方有一人正在语音聊天
+    {
+        append_back_data(W_DataPacket(SOC, 3, "0\r\n"));
+        m_threadpool->append(this, 1);
+    }
+
+    lock.unlock();
 }
 
-long long requestProcess::timestamp()
+//处理回应语音聊天逻辑
+void requestProcess::reply_voice_chat()
 {
-    struct timeval tv;
+    if (m_sessionID == "") //没有权限
+    {
+        append_back_data(W_DataPacket(ROC, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
 
-    gettimeofday(&tv, NULL);
-    return (tv.tv_sec * 1000 + tv.tv_usec / 1000);
+    int l = m_content_length;
+    char choose = '\0';
+
+    //如果超出21个字符，说明不合法
+    if (l > 3)
+    {
+        return;
+    }
+
+    choose = m_content[0];
+
+    //判断用户名和选择是否合法
+
+    bool isNice = true;
+
+    if (choose != '0' && choose != '1')
+    {
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    lock.lock();
+
+    string tar_user = voice_chat_mp[m_username];
+
+    if (voice_chat_mp.find(m_username) != voice_chat_mp.end()) //存在语音聊天申请
+    {
+        if (userfd_mp.find(tar_user) != userfd_mp.end()) //对方在线
+        {
+            if (choose == '1')
+            {
+                int a_chatid, b_chatid;
+                while (voice_id_to_user_mp.find(a_chatid = rand() % 1000000000) != voice_id_to_user_mp.end())
+                    ;
+                while (voice_id_to_user_mp.find(b_chatid = rand() % 1000000000) != voice_id_to_user_mp.end())
+                    ;
+                voice_id_to_user_mp[a_chatid] = m_username;
+                voice_id_to_user_mp[b_chatid] = tar_user;
+
+                user_to_voice_id_mp[m_username] = a_chatid;
+                user_to_voice_id_mp[tar_user] = b_chatid;
+
+                append_back_data(W_DataPacket(AOC, to_string(a_chatid).length() + 2, (to_string(a_chatid) + "\r\n").c_str()));
+                m_threadpool->append(this, 1);
+
+                m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(AOC, to_string(b_chatid).length() + 2, (to_string(b_chatid) + "\r\n").c_str()));
+                m_threadpool->append(m_users + userfd_mp[tar_user], 1);
+            }
+            else if (choose == '0')
+            {
+                voice_chat_mp.erase(m_username);
+                voice_chat_mp.erase(tar_user);
+                m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(DOC, 0, ""));
+                m_threadpool->append(m_users + userfd_mp[tar_user], 1);
+            }
+        }
+    }
+
+    lock.unlock();
+
+    LOG_INFO("user %s %s user %s voice chat request.", m_username.c_str(), (choose == '1' ? "accept" : "reject"), tar_user.c_str());
+    Log::get_instance()->flush();
+}
+
+//处理结束语音聊天逻辑
+void requestProcess::end_voice_chat()
+{
+    if (m_sessionID == "") //没有权限
+    {
+        append_back_data(W_DataPacket(EOC, 4, "-4\r\n"));
+        m_threadpool->append(this, 1);
+        return;
+    }
+
+    string m_username = sessionID_mp[m_sessionID];
+
+    lock.lock();
+
+    string tar_user;
+
+    if (voice_chat_mp.find(m_username) != voice_chat_mp.end()) //存在语音聊天申请
+    {
+        tar_user = voice_chat_mp[m_username];
+
+        voice_chat_mp.erase(m_username);
+        voice_chat_mp.erase(tar_user);
+        voice_id_sockaddr_mp.erase(user_to_voice_id_mp[m_username]);
+        voice_id_sockaddr_mp.erase(user_to_voice_id_mp[tar_user]);
+        voice_id_to_user_mp.erase(user_to_voice_id_mp[m_username]);
+        voice_id_to_user_mp.erase(user_to_voice_id_mp[tar_user]);
+        user_to_voice_id_mp.erase(m_username);
+        user_to_voice_id_mp.erase(tar_user);
+
+        if (userfd_mp.find(tar_user) != userfd_mp.end()) //对方在线
+        {
+            m_users[userfd_mp[tar_user]].append_back_data(W_DataPacket(DOC, 0, ""));
+            m_threadpool->append(m_users + userfd_mp[tar_user], 1);
+        }
+    }
+
+    lock.unlock();
+    append_back_data(W_DataPacket(EOC, 3, "1\r\n"));
+    m_threadpool->append(this, 1);
+    LOG_INFO("user%s stop voice chat with user %s.", m_username.c_str(), tar_user.c_str());
+    Log::get_instance()->flush();
 }

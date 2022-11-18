@@ -14,8 +14,8 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -49,9 +49,14 @@ public:
      SMA表示发送消息；
      RMA表示接收消息；
      RDY表示客户端就绪；
-     IGN为服务器独有，用于表示发送到一半的数据包
-     SAV表示发送头像数据
-     RAV表示接收头像数据
+     IGN为服务器独有，用于表示发送到一半的数据包；
+     SAV表示发送头像数据；
+     RAV表示接收头像数据；
+     SOC表示发起语音聊天；
+     ROC表示回应语音聊天；
+     AOC表示开始语音聊天；
+     DOC表示结束语音聊天；
+     EOC表示挂断语音聊天
      */
     enum PACKET_TYPE
     {
@@ -72,7 +77,12 @@ public:
         RDY,
         IGN,
         SAV,
-        RAV
+        RAV,
+        SOC,
+        ROC,
+        AOC,
+        DOC,
+        EOC
     };
 
     /*主状态机的三种可能状态
@@ -148,6 +158,9 @@ public:
     // REQUEST转const char*
     static const char *ReqToString(PACKET_TYPE r);
 
+    //处理收到的udp包
+    static void handleUdpPack(int udpSocket);
+
 private:
     //初始化连接
     void init();
@@ -199,6 +212,12 @@ private:
     void client_ready();
     //处理更换头像逻辑
     void change_avatar();
+    //处理发起语音聊天逻辑
+    void start_voice_chat();
+    //处理回应语音聊天逻辑
+    void reply_voice_chat();
+    //处理结束语音聊天逻辑
+    void end_voice_chat();
 
     //获取毫秒级别时间戳
     long long timestamp();

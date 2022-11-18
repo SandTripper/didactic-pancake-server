@@ -1,5 +1,7 @@
 #include "time_wheel_timer.h"
 
+#include "../log/log.h"
+
 tw_timer::tw_timer(int rot, int ts)
     : next(NULL), prev(NULL), rotation(rot), time_slot(ts)
 {
@@ -128,6 +130,8 @@ void time_wheel::tick()
             //否则，说明定时器到期，执行定时任务，然后删除该定时器
             else
             {
+                LOG_INFO("%s", "time id go");
+                Log::get_instance()->flush();
                 tmp->cb_func(tmp->user_data);
                 //如果tmp就是该槽的头节点，则重新设置头节点后再删除
                 if (tmp == slots[cur_slot])
